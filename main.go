@@ -16,21 +16,39 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/go-jose/go-jose/v4"
 	"gopkg.in/yaml.v3"
 )
 
 const githubIssuer = "https://token.actions.githubusercontent.com"
+
+// Limits on what callers can make the service do. Any GitHub Actions job can
+// mint a token for the audience, so everything before the allowlist check
+// must be cheap, and allowed callers share one GitHub API rate limit and one
+// destination credential.
+const (
+	maxJobsPerRepo     = 4                // queued or running jobs per calling repository
+	maxJobs            = 32               // queued or running jobs in total
+	maxStoredJobs      = 1000             // finished jobs kept for GET /v1/jobs/{id}
+	jobRetention       = 15 * time.Minute // how long a finished job can be fetched
+	maxJobOutput       = 64 << 10         // bytes of script output kept per job
+	maxPollPerImage    = 10               // verifications per image per poll cycle
+	rejectedRetryAfter = time.Hour        // when the poller retries a refused digest
+)
 
 // config is the allowlist.
 type config struct {
@@ -54,8 +72,10 @@ type image struct {
 }
 
 // publisher says which repo may publish an image, and under which conditions.
+// It is passed to the script as JSON, with SourceRefs and Tags anchored.
 type publisher struct {
 	Repo            string   `yaml:"repo" json:"repo"`
+	RepoID          int64    `yaml:"repo_id" json:"repo_id,omitempty"`
 	SignerWorkflows []string `yaml:"signer_workflows" json:"signer_workflows"`
 	SourceRefs      string   `yaml:"source_refs" json:"source_refs"`
 	Actors          []string `yaml:"actors" json:"actors"`
@@ -70,13 +90,16 @@ type publisher struct {
 // The script re-checks the same rules from the attestations, which is what
 // actually authorises a copy.
 func (p *publisher) allows(cl githubClaims, tags []string) bool {
-	if cl.Repository != p.Repo || !p.sourceRefs.MatchString(cl.Ref) {
+	if !strings.EqualFold(cl.Repository, p.Repo) || !p.sourceRefs.MatchString(cl.Ref) {
+		return false
+	}
+	if p.RepoID != 0 && cl.RepositoryID != strconv.FormatInt(p.RepoID, 10) {
 		return false
 	}
 	if cl.RunnerEnvironment != "github-hosted" && !*p.AllowSelfHosted {
 		return false
 	}
-	if len(p.Actors) > 0 && !contains(p.Actors, cl.Actor) && !contains(p.Actors, cl.TriggeringActor) {
+	if len(p.Actors) > 0 && !contains(p.Actors, cl.Actor) {
 		return false
 	}
 	for _, t := range tags {
@@ -87,14 +110,14 @@ func (p *publisher) allows(cl githubClaims, tags []string) bool {
 	return true
 }
 
+// callerAllowed returns the same error whether or not the image is listed, so
+// callers cannot probe the allowlist.
 func (c *config) callerAllowed(image string, cl githubClaims, tags []string) error {
-	img, ok := c.Images[image]
-	if !ok {
-		return errors.New("image " + image + " is not in the mirror's allowlist")
-	}
-	for _, p := range img.Publishers {
-		if p.allows(cl, tags) {
-			return nil
+	if img, ok := c.Images[image]; ok {
+		for _, p := range img.Publishers {
+			if p.allows(cl, tags) {
+				return nil
+			}
 		}
 	}
 	return fmt.Errorf("%s (ref %s, %s runner) may not publish these tags of %s", cl.Repository, cl.Ref, cl.RunnerEnvironment, image)
@@ -125,19 +148,19 @@ func contains(list []string, s string) bool {
 
 type githubClaims struct {
 	Repository        string `json:"repository"`
+	RepositoryID      string `json:"repository_id"`
 	Actor             string `json:"actor"`
-	TriggeringActor   string `json:"triggering_actor"`
 	Ref               string `json:"ref"`
 	RunnerEnvironment string `json:"runner_environment"`
 	RunID             string `json:"run_id"`
 	RunAttempt        string `json:"run_attempt"`
-	JobWorkflowRef    string `json:"job_workflow_ref"`
 }
 
 type server struct {
-	cfg      *config
-	script   string
-	verifier *oidc.IDTokenVerifier
+	cfg        *config
+	script     string
+	verifier   *oidc.IDTokenVerifier
+	inlineWait time.Duration // how long POST /v1/mirror waits before answering 202
 	// tokens mints GitHub API tokens when a GitHub App is configured;
 	// otherwise the script uses GH_TOKEN from the environment.
 	tokens *appTokens
@@ -160,6 +183,8 @@ var (
 	imageNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
 	tagRe       = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$`)
 	digestRe    = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
+
+	signerWorkflowRe = regexp.MustCompile(`^[^/@]+/[^/@]+/\.github/workflows/[^@]+$`)
 )
 
 func main() {
@@ -176,9 +201,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	provider, err := oidc.NewProvider(context.Background(), githubIssuer)
+	client := &http.Client{Timeout: 10 * time.Second}
+	provider, err := oidc.NewProvider(oidc.ClientContext(context.Background(), client), githubIssuer)
 	if err != nil {
 		slog.Error("oidc provider", "err", err)
+		os.Exit(1)
+	}
+	var discovery struct {
+		JWKSURL string `json:"jwks_uri"`
+	}
+	if err := provider.Claims(&discovery); err != nil || discovery.JWKSURL == "" {
+		slog.Error("oidc provider has no jwks_uri", "err", err)
 		os.Exit(1)
 	}
 
@@ -198,38 +231,121 @@ func main() {
 		os.Exit(1)
 	}
 
-	s := &server{
-		tokens:   tokens,
-		cfg:      cfg,
-		script:   *script,
-		verifier: provider.Verifier(&oidc.Config{ClientID: *audience}),
-		locks:    map[string]*sync.Mutex{},
-		jobs:     map[string]*job{},
-		current:  map[string]string{},
-		rejected: map[string]time.Time{},
-	}
-
+	s := newServer(cfg, *script, newVerifier(githubIssuer, *audience, &keySet{url: discovery.JWKSURL, client: client, minRefresh: time.Minute}))
+	s.tokens = tokens
 	if *pollEvery > 0 {
 		go s.pollLoop(*pollEvery)
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/mirror", s.handleMirror)
-	mux.HandleFunc("GET /v1/jobs/{id}", s.handleJob)
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
-
 	srv := &http.Server{
 		Addr:              *listen,
-		Handler:           mux,
+		Handler:           s.routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      time.Minute,
+		IdleTimeout:       time.Minute,
+		MaxHeaderBytes:    16 << 10,
 	}
 	slog.Info("listening", "addr", *listen, "destination", cfg.Destination, "images", len(cfg.Images), "poll", pollEvery.String())
 	if err := srv.ListenAndServe(); err != nil {
 		slog.Error("serve", "err", err)
 		os.Exit(1)
 	}
+}
+
+func newServer(cfg *config, script string, verifier *oidc.IDTokenVerifier) *server {
+	return &server{
+		cfg:        cfg,
+		script:     script,
+		verifier:   verifier,
+		inlineWait: 25 * time.Second,
+		locks:      map[string]*sync.Mutex{},
+		jobs:       map[string]*job{},
+		current:    map[string]string{},
+		rejected:   map[string]time.Time{},
+	}
+}
+
+func newVerifier(issuer, audience string, keys oidc.KeySet) *oidc.IDTokenVerifier {
+	return oidc.NewVerifier(issuer, keys, &oidc.Config{ClientID: audience, SupportedSigningAlgs: []string{oidc.RS256}})
+}
+
+func (s *server) routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/mirror", s.handleMirror)
+	mux.HandleFunc("GET /v1/jobs/{id}", s.handleJob)
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	return mux
+}
+
+// keySet verifies token signatures against the issuer's JWKS. go-oidc's
+// RemoteKeySet refetches the JWKS for every token it cannot verify, so anyone
+// could make the service fetch it on every request with a made-up key ID or
+// signature. This refetches at most once per minRefresh.
+type keySet struct {
+	url        string
+	client     *http.Client
+	minRefresh time.Duration
+
+	mu      sync.Mutex
+	keys    map[string]jose.JSONWebKey
+	fetched time.Time
+}
+
+func (k *keySet) VerifySignature(_ context.Context, raw string) ([]byte, error) {
+	jws, err := jose.ParseSigned(raw, []jose.SignatureAlgorithm{jose.RS256})
+	if err != nil {
+		return nil, err
+	}
+	if len(jws.Signatures) != 1 {
+		return nil, errors.New("expected exactly one signature")
+	}
+	key, err := k.key(jws.Signatures[0].Header.KeyID)
+	if err != nil {
+		return nil, err
+	}
+	return jws.Verify(key)
+}
+
+func (k *keySet) key(kid string) (*jose.JSONWebKey, error) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if key, ok := k.keys[kid]; ok {
+		return &key, nil
+	}
+	if time.Since(k.fetched) < k.minRefresh {
+		return nil, fmt.Errorf("unknown key ID %q", kid)
+	}
+	k.fetched = time.Now()
+	resp, err := k.client.Get(k.url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch keys: %s", resp.Status)
+	}
+	var set jose.JSONWebKeySet
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&set); err != nil {
+		return nil, fmt.Errorf("decode keys: %w", err)
+	}
+	k.keys = map[string]jose.JSONWebKey{}
+	for _, key := range set.Keys {
+		if key.KeyID != "" {
+			k.keys[key.KeyID] = key
+		}
+	}
+	if key, ok := k.keys[kid]; ok {
+		return &key, nil
+	}
+	return nil, fmt.Errorf("unknown key ID %q", kid)
+}
+
+// anchor makes a config regex match whole strings: an unanchored
+// source_refs of refs/heads/main must not also allow refs/heads/main-evil.
+// The plain group works in RE2, jq and POSIX ERE alike.
+func anchor(re string) string {
+	return "^(" + re + ")$"
 }
 
 func loadConfig(path string) (*config, error) {
@@ -258,6 +374,14 @@ func loadConfig(path string) (*config, error) {
 			if owner, repo, ok := strings.Cut(p.Repo, "/"); !ok || owner == "" || repo == "" || strings.Contains(repo, "/") {
 				return nil, fmt.Errorf("images.%s: repo must be <owner>/<name>", name)
 			}
+			if p.RepoID < 0 {
+				return nil, fmt.Errorf("images.%s: invalid repo_id", name)
+			}
+			for _, w := range p.SignerWorkflows {
+				if !signerWorkflowRe.MatchString(w) {
+					return nil, fmt.Errorf("images.%s: signer_workflows entries must be <owner>/<repo>/.github/workflows/<file>, without @ref", name)
+				}
+			}
 			if p.SourceRefs == "" {
 				p.SourceRefs = c.Defaults.SourceRefs
 			}
@@ -268,10 +392,12 @@ func loadConfig(path string) (*config, error) {
 				v := c.Defaults.AllowSelfHosted
 				p.AllowSelfHosted = &v
 			}
+			p.SourceRefs = anchor(p.SourceRefs)
 			if p.sourceRefs, err = regexp.Compile(p.SourceRefs); err != nil {
 				return nil, fmt.Errorf("images.%s.source_refs: %w", name, err)
 			}
 			if p.Tags != "" {
+				p.Tags = anchor(p.Tags)
 				if p.tags, err = regexp.Compile(p.Tags); err != nil {
 					return nil, fmt.Errorf("images.%s.tags: %w", name, err)
 				}
@@ -306,7 +432,7 @@ func (s *server) handleMirror(w http.ResponseWriter, r *http.Request) {
 	for _, p := range req.Tags {
 		tag, digest, ok := strings.Cut(p, "@")
 		if !ok || !tagRe.MatchString(tag) || !digestRe.MatchString(digest) {
-			http.Error(w, "invalid tag: "+p, http.StatusBadRequest)
+			http.Error(w, "invalid tag@digest pair", http.StatusBadRequest)
 			return
 		}
 		tags = append(tags, tag)
@@ -319,19 +445,25 @@ func (s *server) handleMirror(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requestID := fmt.Sprintf("%s-%s-%s", claims.RunID, claims.RunAttempt, randomHex(4))
-	sourceRun := fmt.Sprintf("https://github.com/%s/actions/runs/%s", claims.Repository, claims.RunID)
 	log := slog.With("request", requestID, "image", req.Image, "repo", claims.Repository, "ref", claims.Ref)
-	log.Info("mirror request", "tags", req.Tags)
 
 	// The copy runs detached from the request, so a dropped connection or a
 	// proxy timeout does not abort it. Short jobs answer inline; longer ones
 	// answer 202 with a job ID to poll.
 	id := randomHex(16)
-	j := &job{repo: claims.Repository, start: start, done: make(chan struct{})}
-	s.addJob(id, j)
+	j := &job{repo: strings.ToLower(claims.Repository), repoID: claims.RepositoryID, start: start, done: make(chan struct{})}
+	if err := s.addJob(id, j); err != nil {
+		log.Warn("mirror request refused", "err", err)
+		w.Header().Set("Retry-After", "30")
+		http.Error(w, err.Error(), http.StatusTooManyRequests)
+		return
+	}
+	log.Info("mirror request", "tags", req.Tags)
 	go func() {
-		out, err := s.mirror(context.Background(), req.Image, req.Tags, requestID, sourceRun)
+		out, err := s.mirror(context.Background(), req.Image, req.Tags, requestID)
+		s.jobsMu.Lock()
 		j.out, j.err, j.end = out, err, time.Now()
+		s.jobsMu.Unlock()
 		if err != nil {
 			log.Warn("mirror failed", "err", err, "elapsed", j.end.Sub(start).Round(time.Millisecond))
 		} else {
@@ -343,7 +475,7 @@ func (s *server) handleMirror(w http.ResponseWriter, r *http.Request) {
 	select {
 	case <-j.done:
 		writeJob(w, j)
-	case <-time.After(25 * time.Second):
+	case <-time.After(s.inlineWait):
 		w.Header().Set("Location", "/v1/jobs/"+id)
 		w.WriteHeader(http.StatusAccepted)
 		fmt.Fprintln(w, id)
@@ -351,22 +483,46 @@ func (s *server) handleMirror(w http.ResponseWriter, r *http.Request) {
 }
 
 type job struct {
-	repo       string
-	start, end time.Time
-	out        string
-	err        error
-	done       chan struct{}
+	repo, repoID string
+	start, end   time.Time
+	out          string
+	err          error
+	done         chan struct{}
 }
 
-func (s *server) addJob(id string, j *job) {
+// addJob stores j, or refuses it when its repository or the whole service
+// already has too many jobs queued or running. Finished jobs are dropped
+// after jobRetention, or oldest first once maxStoredJobs are kept.
+func (s *server) addJob(id string, j *job) error {
 	s.jobsMu.Lock()
 	defer s.jobsMu.Unlock()
+	running, mine := 0, 0
+	var oldestID string
+	var oldest time.Time
 	for k, old := range s.jobs {
-		if !old.end.IsZero() && time.Since(old.end) > time.Hour {
+		switch {
+		case old.end.IsZero():
+			running++
+			if old.repo == j.repo {
+				mine++
+			}
+		case time.Since(old.end) > jobRetention:
 			delete(s.jobs, k)
+		case oldestID == "" || old.end.Before(oldest):
+			oldestID, oldest = k, old.end
 		}
 	}
+	if mine >= maxJobsPerRepo {
+		return fmt.Errorf("%s already has %d mirror jobs queued or running", j.repo, mine)
+	}
+	if running >= maxJobs {
+		return errors.New("too many mirror jobs queued or running")
+	}
+	if len(s.jobs) >= maxStoredJobs && oldestID != "" {
+		delete(s.jobs, oldestID)
+	}
 	s.jobs[id] = j
+	return nil
 }
 
 func (s *server) handleJob(w http.ResponseWriter, r *http.Request) {
@@ -377,7 +533,7 @@ func (s *server) handleJob(w http.ResponseWriter, r *http.Request) {
 	s.jobsMu.Lock()
 	j := s.jobs[r.PathValue("id")]
 	s.jobsMu.Unlock()
-	if j == nil || j.repo != claims.Repository {
+	if j == nil || j.repo != strings.ToLower(claims.Repository) || j.repoID != claims.RepositoryID {
 		http.Error(w, "no such job", http.StatusNotFound)
 		return
 	}
@@ -412,7 +568,7 @@ func (s *server) authenticate(w http.ResponseWriter, r *http.Request) (githubCla
 		http.Error(w, "invalid token", http.StatusUnauthorized)
 		return claims, false
 	}
-	if err := tok.Claims(&claims); err != nil {
+	if err := tok.Claims(&claims); err != nil || claims.Repository == "" {
 		http.Error(w, "invalid token claims", http.StatusUnauthorized)
 		return claims, false
 	}
@@ -420,7 +576,7 @@ func (s *server) authenticate(w http.ResponseWriter, r *http.Request) (githubCla
 }
 
 // mirror runs the verify-and-copy script with the per-image lock held.
-func (s *server) mirror(ctx context.Context, image string, pairs []string, requestID, sourceRun string) (string, error) {
+func (s *server) mirror(ctx context.Context, image string, pairs []string, requestID string) (string, error) {
 	lock := s.lock(image)
 	lock.Lock()
 	defer lock.Unlock()
@@ -439,6 +595,7 @@ func (s *server) mirror(ctx context.Context, image string, pairs []string, reque
 		}
 		env = append(env, "GH_TOKEN="+tok) // the last value of a duplicate key wins
 	}
+	out := &cappedBuffer{max: maxJobOutput}
 	cmd := exec.CommandContext(ctx, "bash", s.script)
 	cmd.Env = append(env,
 		"RULE="+string(rule),
@@ -447,9 +604,14 @@ func (s *server) mirror(ctx context.Context, image string, pairs []string, reque
 		"IMAGE="+image,
 		"TAGS="+strings.Join(pairs, " "),
 		"REQUEST_ID="+requestID,
-		"SOURCE_RUN="+sourceRun,
 	)
-	out, err := cmd.CombinedOutput()
+	cmd.Stdout, cmd.Stderr = out, out
+	// On timeout, kill the script's whole process group, not just bash, so
+	// a hung gh or regctl cannot keep the image lock.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.WaitDelay = 10 * time.Second
+	err = cmd.Run()
 	if err == nil {
 		s.stateMu.Lock()
 		for _, p := range pairs {
@@ -458,7 +620,33 @@ func (s *server) mirror(ctx context.Context, image string, pairs []string, reque
 		}
 		s.stateMu.Unlock()
 	}
-	return string(out), err
+	return out.String(), err
+}
+
+// cappedBuffer keeps the first max bytes written to it.
+type cappedBuffer struct {
+	mu        sync.Mutex
+	max       int
+	b         []byte
+	truncated bool
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := min(len(p), c.max-len(c.b))
+	c.b = append(c.b, p[:n]...)
+	c.truncated = c.truncated || n < len(p)
+	return len(p), nil
+}
+
+func (c *cappedBuffer) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.truncated {
+		return string(c.b) + "\n[output truncated]\n"
+	}
+	return string(c.b)
 }
 
 func (s *server) lock(image string) *sync.Mutex {
@@ -477,9 +665,17 @@ func (s *server) pollLoop(every time.Duration) {
 	}
 }
 
-// pollOnce mirrors every allowed GHCR tag whose destination differs, for
+// pollOnce mirrors every allowed source tag whose destination differs, for
 // every image in the allowlist.
 func (s *server) pollOnce(ctx context.Context) {
+	s.stateMu.Lock()
+	for k, t := range s.rejected {
+		if time.Since(t) > rejectedRetryAfter {
+			delete(s.rejected, k)
+		}
+	}
+	s.stateMu.Unlock()
+
 	names := make([]string, 0, len(s.cfg.Images))
 	for name := range s.cfg.Images {
 		names = append(names, name)
@@ -491,7 +687,7 @@ func (s *server) pollOnce(ctx context.Context) {
 		dest := s.cfg.Destination + "/" + name
 		tags, err := regctl(ctx, "tag", "ls", src)
 		if err != nil {
-			continue // no GHCR package for this image (yet)
+			continue // no source package for this image (yet)
 		}
 
 		var pairs []string
@@ -500,7 +696,7 @@ func (s *server) pollOnce(ctx context.Context) {
 				continue
 			}
 			digest, err := regctl(ctx, "image", "digest", src+":"+tag)
-			if err != nil {
+			if err != nil || !digestRe.MatchString(digest) {
 				log.Warn("source digest", "tag", tag, "err", err)
 				continue
 			}
@@ -521,16 +717,22 @@ func (s *server) pollOnce(ctx context.Context) {
 			pairs = append(pairs, tag+"@"+digest)
 		}
 
+		// Anyone who can push to the source package can add tags, so cap the
+		// verifications per image per cycle; the rest wait for later cycles.
+		if len(pairs) > maxPollPerImage {
+			log.Warn("many tags to verify; deferring some to later cycles", "pending", len(pairs), "this_cycle", maxPollPerImage)
+			pairs = pairs[:maxPollPerImage]
+		}
 		// Mirror tag by tag so one unverifiable tag does not block the rest.
 		for _, p := range pairs {
 			start := time.Now()
-			out, err := s.mirror(ctx, name, []string{p}, "poll-"+randomHex(4), "")
+			out, err := s.mirror(ctx, name, []string{p}, "poll-"+randomHex(4))
 			if err != nil {
 				_, digest, _ := strings.Cut(p, "@")
 				s.stateMu.Lock()
 				s.rejected[name+"@"+digest] = time.Now()
 				s.stateMu.Unlock()
-				log.Warn("poll mirror refused; not retrying this digest", "tag", p, "output", lastLines(out, 3))
+				log.Warn("poll mirror refused; retrying this digest later", "tag", p, "retry_after", rejectedRetryAfter, "output", lastLines(out, 3))
 				continue
 			}
 			log.Info("poll mirrored", "tag", p, "elapsed", time.Since(start).Round(time.Millisecond))

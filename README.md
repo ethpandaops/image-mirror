@@ -20,15 +20,18 @@ image-mirror to copy it. Only image-mirror holds the destination credential.
    platform manifest), it verifies the attestation with `gh attestation verify`
    and checks it against the image's allowlist entry.
 4. If everything checks out, it copies the image by digest with
-   `regctl image copy`, including referrers, and confirms the destination
-   digest matches.
+   `regctl image copy` and confirms the destination digest matches. Only the
+   image is copied: referrers and `sha256-*` digest tags are not, because
+   anyone who can push to the source can attach them and nothing attests
+   them.
 
 A request is refused unless:
 
 - the image is in the allowlist;
 - one of the image's publishers has attested every digest, from an allowed
   ref, on a GitHub-hosted runner (unless that publisher allows self-hosted
-  runners), and, when configured, from an allowed workflow and actor;
+  runners), and, when configured, from the repository with the configured
+  ID, an allowed workflow and an allowed actor;
 - every tag matches the publisher's tag pattern;
 - each source tag currently points at the requested digest;
 - the destination repository already exists. image-mirror never creates
@@ -55,6 +58,7 @@ the audience configured with `-audience`:
 | `401` | Missing or invalid token. |
 | `403` | The calling repository, ref or runner may not publish this image. |
 | `422` | Verification or copy failed. The body says why. |
+| `429` | The calling repository already has 4 jobs queued or running, or the service has 32. Retry later. |
 
 The caller's token is checked first so bad requests fail fast, but the
 attestations are what authorise a copy. Copies run detached from the request,
@@ -84,8 +88,10 @@ steps:
 
 Every `-poll-interval`, image-mirror lists the source tags of each allowlisted
 image and mirrors any whose destination digest differs. This catches requests
-that were missed and images whose workflows never call the endpoint. A digest
-that fails verification is logged and not retried until restart.
+that were missed and images whose workflows never call the endpoint. It
+verifies at most 10 tags per image per cycle, so a flood of tags in one source
+package cannot starve the others. A digest that fails verification is logged
+and retried after an hour.
 
 ## Configuration
 
@@ -111,32 +117,55 @@ images:
     publishers:
       - repo: example/my-repo
       - repo: example/builder
-        tags: '^nightly-'
+        tags: 'nightly-.*'
 
   release-image:
     publishers:
       - repo: example/release-repo
-        source_refs: '^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'
+        repo_id: 123456789       # gh api repos/example/release-repo --jq .id
+        source_refs: 'refs/tags/v[0-9]+\.[0-9]+\.[0-9]+'
         signer_workflows:
           - example/release-repo/.github/workflows/release.yaml
         actors: [alice, bob]     # who triggered the attested run
-        tags: '^(v[0-9.]+|latest)$'
+        tags: 'v[0-9.]+|latest'
 ```
 
 A request is allowed when one publisher allows all of it. Unknown fields are
-an error, so a misspelt restriction can't be silently ignored.
+an error, so a misspelt restriction can't be silently ignored. Regexes must
+match the whole ref or tag: `refs/heads/main` does not allow
+`refs/heads/main-old`, and `nightly-` allows only the tag `nightly-`. Write
+them in the common subset of Go RE2 and jq (Oniguruma) syntax, which both
+the service and the verify script evaluate.
 
 | Publisher field | Meaning |
 | --- | --- |
 | `repo` | `owner/name` of the repository whose attestations count. |
-| `source_refs` | Regex the attested ref must match. Defaults to `defaults.source_refs`. |
-| `signer_workflows` | Workflow files (`owner/repo/path`) allowed to have signed the attestation. Any workflow in `repo` when unset. |
-| `actors` | GitHub users allowed to have triggered the attested run. Any when unset. |
-| `tags` | Regex every requested tag must match. Any when unset. |
+| `repo_id` | Numeric ID of `repo`. When set, attestations and callers must come from the repository with this ID as well as this name, so a repository deleted or renamed and then recreated under the same name, or an owner name taken over, cannot publish. Recommended. |
+| `source_refs` | Regex the whole attested ref must match. Defaults to `defaults.source_refs`. |
+| `signer_workflows` | Workflow files (`owner/repo/.github/workflows/file`) allowed to have signed the attestation, matched exactly. Any workflow in `repo` when unset. |
+| `actors` | GitHub logins allowed to have triggered the attested run. Both the user who started the run and the user who started the attested attempt must be listed. Any when unset. |
+| `tags` | Regex every whole requested tag must match. Any when unset. |
 | `allow_self_hosted` | Accept attestations made on self-hosted runners. Anyone who controls a runner that can pick up `repo`'s jobs can then publish the image. |
 
-`actors` is checked by looking up the attested run, so pair it with a rule on
-who can push the refs in `source_refs` (for example a tag ruleset).
+`actors` is checked by looking up the attested run attempt, so pair it with a
+rule on who can push the refs in `source_refs` (for example a tag ruleset).
+Logins can be renamed and reused; `actors` trusts whoever holds the login when
+the run is looked up.
+
+### What an attestation does and does not prove
+
+An attestation binds a digest to the repository, ref, workflow and runner that
+signed it. It does not bind a tag. Anyone who can push to the source package
+can point an allowed tag at any digest the publisher ever attested from an
+allowed ref, and the poller will mirror that tag, for example to roll
+`latest` back to an older release. Restrict who can write to the source
+packages, and use `tags` and `source_refs` to keep release tags and branch
+builds apart.
+
+The attestation is also only as good as the job that made it: it says that
+job vouched for the digest, not that it built it. A job that attests what a
+tag points to after another job pushed it (for example a merge job in a
+split build) vouches for that other job's output.
 
 ### Flags
 
@@ -175,8 +204,16 @@ docker run --rm -p 8080:8080 \
   -config /config/images.yaml
 ```
 
-The container runs as an unprivileged user, includes `gh`, `regctl` and `jq`,
-and serves `GET /healthz`. To build it yourself:
+Each image has a build provenance attestation:
+
+```sh
+gh attestation verify oci://ghcr.io/ethpandaops/image-mirror@sha256:… --repo ethpandaops/image-mirror
+```
+
+The container runs as UID 10001, includes pinned, checksummed `gh`, `regctl`
+and `jq`, and serves `GET /healthz`. It needs a writable home directory and
+`/tmp` (`regctl` keeps its registry logins in `~/.regctl`). It serves plain
+HTTP: put it behind a proxy that terminates TLS. To build it yourself:
 
 ```sh
 docker build -t image-mirror .
@@ -190,8 +227,8 @@ tags.
 ## Development
 
 ```sh
-go test ./...
-bash -n scripts/mirror.sh
+go test ./...          # needs bash and jq: it runs scripts/mirror.sh against fake gh and regctl
+shellcheck scripts/mirror.sh
 ```
 
 [GitHub artifact attestations]: https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations
