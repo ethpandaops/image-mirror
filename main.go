@@ -138,6 +138,9 @@ type server struct {
 	cfg      *config
 	script   string
 	verifier *oidc.IDTokenVerifier
+	// tokens mints GitHub API tokens when a GitHub App is configured;
+	// otherwise the script uses GH_TOKEN from the environment.
+	tokens *appTokens
 
 	jobsMu sync.Mutex
 	jobs   map[string]*job
@@ -179,7 +182,24 @@ func main() {
 		os.Exit(1)
 	}
 
+	var tokens *appTokens
+	if appID := os.Getenv("GITHUB_APP_ID"); appID != "" {
+		tokens, err = newAppTokens(appID, os.Getenv("GITHUB_APP_INSTALLATION_ID"), os.Getenv("GITHUB_APP_PRIVATE_KEY_FILE"))
+		if err != nil {
+			slog.Error("github app", "err", err)
+			os.Exit(1)
+		}
+		if _, err := tokens.Token(context.Background()); err != nil {
+			slog.Error("github app", "err", err)
+			os.Exit(1)
+		}
+	} else if os.Getenv("GH_TOKEN") == "" {
+		slog.Error("set GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID and GITHUB_APP_PRIVATE_KEY_FILE, or GH_TOKEN")
+		os.Exit(1)
+	}
+
 	s := &server{
+		tokens:   tokens,
 		cfg:      cfg,
 		script:   *script,
 		verifier: provider.Verifier(&oidc.Config{ClientID: *audience}),
@@ -411,8 +431,16 @@ func (s *server) mirror(ctx context.Context, image string, pairs []string, reque
 	if err != nil {
 		return "", err
 	}
+	env := os.Environ()
+	if s.tokens != nil {
+		tok, err := s.tokens.Token(ctx)
+		if err != nil {
+			return err.Error(), err
+		}
+		env = append(env, "GH_TOKEN="+tok) // the last value of a duplicate key wins
+	}
 	cmd := exec.CommandContext(ctx, "bash", s.script)
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(env,
 		"RULE="+string(rule),
 		"SOURCE="+s.cfg.Source,
 		"DESTINATION="+s.cfg.Destination,

@@ -152,7 +152,8 @@ who can push the refs in `source_refs` (for example a tag ruleset).
 
 | Variable | |
 | --- | --- |
-| `GH_TOKEN` | GitHub token for the attestations API and run lookups. Read-only access is enough. |
+| `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY_FILE` | A GitHub App used for the attestations API and run lookups. The service mints installation tokens scoped to read-only `attestations`, `actions` and `metadata`, refreshes them before they expire, and hands only the token to its subprocesses. The App needs those three read permissions and an installation on the repositories that publish images. |
+| `GH_TOKEN` | Instead of a GitHub App: a static read-only GitHub token. |
 | `DESTINATION_USERNAME`, `DESTINATION_TOKEN` | Push credential for the destination registry. |
 | `SOURCE_USERNAME`, `SOURCE_TOKEN` | Optional, to read private source images. |
 
@@ -167,7 +168,9 @@ commit on `main`. Pin a commit SHA or digest in production.
 ```sh
 docker run --rm -p 8080:8080 \
   -v "$PWD/images.yaml:/config/images.yaml:ro" \
-  -e GH_TOKEN -e DESTINATION_USERNAME -e DESTINATION_TOKEN \
+  -v "$PWD/app.pem:/secrets/app.pem:ro" \
+  -e GITHUB_APP_ID -e GITHUB_APP_INSTALLATION_ID -e GITHUB_APP_PRIVATE_KEY_FILE=/secrets/app.pem \
+  -e DESTINATION_USERNAME -e DESTINATION_TOKEN \
   ghcr.io/ethpandaops/image-mirror:latest \
   -config /config/images.yaml
 ```
@@ -179,8 +182,8 @@ and serves `GET /healthz`. To build it yourself:
 docker build -t image-mirror .
 ```
 
-On Kubernetes, mount the allowlist from a ConfigMap, the credentials from a
-Secret, and point a liveness probe at `/healthz`. Run one replica: jobs and the
+On Kubernetes, mount the allowlist from a ConfigMap, the App key as a file and
+the destination credential from a Secret, and point a liveness probe at `/healthz`. Run one replica: jobs and the
 poller's state live in memory, and two replicas would poll and copy the same
 tags.
 
