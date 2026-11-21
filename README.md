@@ -160,15 +160,29 @@ Credentials are passed to `regctl` on stdin, never as arguments.
 
 ## Running
 
+Images are published to `ghcr.io/ethpandaops/image-mirror` for `linux/amd64`
+and `linux/arm64`, tagged `latest` and with the full commit SHA of every
+commit on `main`. Pin a commit SHA or digest in production.
+
 ```sh
-docker build -t image-mirror .
-docker run -v "$PWD/images.yaml:/config/images.yaml:ro" \
+docker run --rm -p 8080:8080 \
+  -v "$PWD/images.yaml:/config/images.yaml:ro" \
   -e GH_TOKEN -e DESTINATION_USERNAME -e DESTINATION_TOKEN \
-  -p 8080:8080 image-mirror -config /config/images.yaml
+  ghcr.io/ethpandaops/image-mirror:latest \
+  -config /config/images.yaml
 ```
 
-The image contains `gh`, `regctl` and `jq`, which the verify-and-copy script
-needs. `GET /healthz` returns `200` when the server is up.
+The container runs as an unprivileged user, includes `gh`, `regctl` and `jq`,
+and serves `GET /healthz`. To build it yourself:
+
+```sh
+docker build -t image-mirror .
+```
+
+On Kubernetes, mount the allowlist from a ConfigMap, the credentials from a
+Secret, and point a liveness probe at `/healthz`. Run one replica: jobs and the
+poller's state live in memory, and two replicas would poll and copy the same
+tags.
 
 ## Development
 
