@@ -181,7 +181,7 @@ split build) vouches for that other job's output.
 
 | Variable | |
 | --- | --- |
-| `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY_FILE` | A GitHub App used for the attestations API and run lookups. The service mints installation tokens scoped to read-only `attestations`, `actions` and `metadata`, refreshes them before they expire, and hands only the token to its subprocesses. The App needs those three read permissions and an installation on the repositories that publish images. |
+| `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY_FILE` | A GitHub App used for the attestations API and run lookups. The service mints installation tokens scoped to read-only `attestations`, `actions` and `metadata`, refreshes them so each lasts longer than a verify-and-copy run, and passes subprocesses only the token in their environment (they run as the same user, so they can still read the key file). The App needs those three read permissions and an installation on the repositories that publish images. |
 | `GH_TOKEN` | Instead of a GitHub App: a static read-only GitHub token. |
 | `DESTINATION_USERNAME`, `DESTINATION_TOKEN` | Push credential for the destination registry. |
 | `SOURCE_USERNAME`, `SOURCE_TOKEN` | Optional, to read private source images. |

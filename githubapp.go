@@ -81,11 +81,11 @@ func parseRSAKey(b []byte) (*rsa.PrivateKey, error) {
 }
 
 // Token returns a cached installation token, minting a new one when the
-// cached one has less than ten minutes left.
+// cached one would expire before a script started now hits its timeout.
 func (a *appTokens) Token(ctx context.Context) (string, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.token != "" && time.Until(a.expires) > 10*time.Minute {
+	if a.token != "" && time.Until(a.expires) > scriptTimeout+5*time.Minute {
 		return a.token, nil
 	}
 

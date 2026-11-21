@@ -48,6 +48,7 @@ const (
 	maxJobOutput       = 64 << 10         // bytes of script output kept per job
 	maxPollPerImage    = 10               // verifications per image per poll cycle
 	rejectedRetryAfter = time.Hour        // when the poller retries a refused digest
+	scriptTimeout      = 15 * time.Minute // one verify-and-copy run, after the image lock
 )
 
 // config is the allowlist.
@@ -581,7 +582,7 @@ func (s *server) mirror(ctx context.Context, image string, pairs []string, reque
 	lock.Lock()
 	defer lock.Unlock()
 
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, scriptTimeout)
 	defer cancel()
 	rule, err := json.Marshal(s.cfg.Images[image].Publishers)
 	if err != nil {
