@@ -133,7 +133,7 @@ func cert(overrides map[string]any) map[string]any {
 	return c
 }
 
-func (f *fakeTools) run(publishers, pairs string) (string, error) {
+func (f *fakeTools) run(publishers, pairs string, env ...string) (string, error) {
 	path := filepath.Join(f.t.TempDir(), "images.yaml")
 	f.write(path, "source: src.example\ndestination: dest.example\nimages:\n  img:\n    publishers:\n"+publishers)
 	cfg, err := loadConfig(path)
@@ -153,6 +153,7 @@ func (f *fakeTools) run(publishers, pairs string) (string, error) {
 		"TAGS=" + pairs,
 		"REQUEST_ID=test",
 	}
+	cmd.Env = append(cmd.Env, env...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -234,6 +235,24 @@ func TestScriptCopiesOnlyTheImage(t *testing.T) {
 	// nothing attests, are not copied.
 	if got, want := strings.TrimSpace(f.copies()), "image copy src.example/img@"+d+" dest.example/img:v1.0.0"; got != want {
 		t.Fatalf("copy = %q, want %q", got, want)
+	}
+}
+
+// The poller runs with FILL_ONLY: re-pointing a source tag at another attested
+// digest (rolling latest back, say) must not move the destination tag.
+func TestScriptFillOnlyNeverMovesTags(t *testing.T) {
+	f := newFakeTools(t)
+	older := f.image("latest", "amd64")
+	f.attestTree(older, []string{"amd64"}, cert(nil))
+	f.set("digest", "dest.example/img:latest", []byte(digestOf("current release")))
+
+	out, err := f.run("      - repo: example/app\n", "latest@"+older, "FILL_ONLY=true")
+	if err != nil || f.copies() != "" || !strings.Contains(out, "left at") {
+		t.Fatalf("fill-only moved an existing tag (err %v, copies %q):\n%s", err, f.copies(), out)
+	}
+	// A publish request (not fill-only) does move it.
+	if out, err := f.run("      - repo: example/app\n", "latest@"+older); err != nil || f.copies() == "" {
+		t.Fatalf("publish request did not move the tag (err %v):\n%s", err, out)
 	}
 }
 

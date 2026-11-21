@@ -154,10 +154,14 @@ done < <(jq -c '.[]' <<<"$RULE")
 # Only the attested image is copied. Referrers and sha256-* digest tags are
 # not: anyone who can push to the source can attach them, and they are not
 # covered by any attestation.
+# FILL_ONLY (the poller) creates missing tags but never moves existing ones.
 for i in "${!tags[@]}"; do
   target="${dest}:${tags[$i]}"
-  if [[ $(regctl image digest "$target" 2>/dev/null || true) == "${digests[$i]}" ]]; then
+  existing=$(regctl image digest "$target" 2>/dev/null || true)
+  if [[ $existing == "${digests[$i]}" ]]; then
     result="already current"
+  elif [[ ${FILL_ONLY:-false} == true && -n $existing ]]; then
+    result="left at ${existing:0:19}: existing tags only move through publish requests"
   else
     regctl image copy "${src}@${digests[$i]}" "$target" >/dev/null
     [[ $(regctl image digest "$target") == "${digests[$i]}" ]] || fail "digest mismatch after copying ${target}"

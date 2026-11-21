@@ -87,9 +87,11 @@ steps:
 ### Poller
 
 Every `-poll-interval`, image-mirror lists the source tags of each allowlisted
-image and mirrors any whose destination digest differs. This catches requests
-that were missed and images whose workflows never call the endpoint. It
-verifies at most 10 tags per image per cycle, so a flood of tags in one source
+image and mirrors any the destination doesn't have yet. This catches requests
+that were missed and images whose workflows never call the endpoint. It never
+moves a tag that already exists at the destination: moving tags such as
+`latest` only change through a request from a publishing job. It verifies at
+most `-poll-max-per-image` tags per image per cycle, so a flood of tags in one source
 package cannot starve the others. A digest that fails verification is logged
 and retried after an hour.
 
@@ -157,8 +159,10 @@ the run is looked up.
 An attestation binds a digest to the repository, ref, workflow and runner that
 signed it. It does not bind a tag. Anyone who can push to the source package
 can point an allowed tag at any digest the publisher ever attested from an
-allowed ref, and the poller will mirror that tag, for example to roll
-`latest` back to an older release. Restrict who can write to the source
+allowed ref. The poller only creates missing tags, so this can't move an
+existing destination tag on its own, but a new tag can still be created
+pointing at any such digest, and a publish request can be replayed with a
+token from the publishing repository. Restrict who can write to the source
 packages, and use `tags` and `source_refs` to keep release tags and branch
 builds apart.
 

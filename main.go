@@ -479,7 +479,7 @@ func (s *server) handleMirror(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Info("mirror request", "tags", req.Tags)
 	go func() {
-		out, err := s.mirror(context.Background(), req.Image, req.Tags, requestID)
+		out, err := s.mirror(context.Background(), req.Image, req.Tags, requestID, false)
 		s.jobsMu.Lock()
 		j.out, j.err, j.end = out, err, time.Now()
 		s.jobsMu.Unlock()
@@ -594,8 +594,9 @@ func (s *server) authenticate(w http.ResponseWriter, r *http.Request) (githubCla
 	return claims, true
 }
 
-// mirror runs the verify-and-copy script with the per-image lock held.
-func (s *server) mirror(ctx context.Context, image string, pairs []string, requestID string) (string, error) {
+// mirror runs the verify-and-copy script. With fillOnly, it only creates
+// destination tags that don't exist; it never moves an existing one.
+func (s *server) mirror(ctx context.Context, image string, pairs []string, requestID string, fillOnly bool) (string, error) {
 	lock := s.lock(image)
 	lock.Lock()
 	defer lock.Unlock()
@@ -623,6 +624,7 @@ func (s *server) mirror(ctx context.Context, image string, pairs []string, reque
 		"IMAGE="+image,
 		"TAGS="+strings.Join(pairs, " "),
 		"REQUEST_ID="+requestID,
+		"FILL_ONLY="+strconv.FormatBool(fillOnly),
 	)
 	cmd.Stdout, cmd.Stderr = out, out
 	// On timeout, kill the script's whole process group, not just bash, so
@@ -727,10 +729,23 @@ func (s *server) pollOnce(ctx context.Context) {
 			if known || bad {
 				continue
 			}
-			if d, err := regctl(ctx, "image", "digest", dest+":"+tag); err == nil && d == digest {
+			// The poller only fills tags the destination lacks. Anyone who
+			// can push to the source package can re-point a tag at another
+			// attested digest (an older release, say), so moving an existing
+			// destination tag needs an authenticated request from a
+			// publishing job.
+			d, err := regctl(ctx, "image", "digest", dest+":"+tag)
+			switch {
+			case err == nil:
+				if d != digest {
+					log.Info("destination tag differs; not moving it from the poller", "tag", tag, "source", digest, "destination", d)
+				}
 				s.stateMu.Lock()
 				s.current[key] = digest
 				s.stateMu.Unlock()
+				continue
+			case !strings.Contains(err.Error(), "[http 404]"):
+				log.Warn("destination digest", "tag", tag, "err", err)
 				continue
 			}
 			pairs = append(pairs, tag+"@"+digest)
@@ -745,7 +760,7 @@ func (s *server) pollOnce(ctx context.Context) {
 		// Mirror tag by tag so one unverifiable tag does not block the rest.
 		for _, p := range pairs {
 			start := time.Now()
-			out, err := s.mirror(ctx, name, []string{p}, "poll-"+randomHex(4))
+			out, err := s.mirror(ctx, name, []string{p}, "poll-"+randomHex(4), true)
 			if err != nil {
 				_, digest, _ := strings.Cut(p, "@")
 				s.stateMu.Lock()
