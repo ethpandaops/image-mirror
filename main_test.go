@@ -14,20 +14,27 @@ destination: docker.io/example
 defaults:
   source_refs: '.*'
 images:
-  app: example/app
-  client-image: example/builder
+  app:
+    publishers:
+      - repo: example/app
+  client-image:
+    publishers:
+      - repo: example/builder
   shared:
-    - example/shared
-    - repo: example/builder
-      tags: '^branch-'
+    publishers:
+      - repo: example/shared
+      - repo: example/builder
+        tags: '^branch-'
   heavy:
-    repo: example/heavy
-    allow_self_hosted: true
+    publishers:
+      - repo: example/heavy
+        allow_self_hosted: true
   locked:
-    repo: example/locked
-    signer_workflows: [example/locked/.github/workflows/release.yaml]
-    source_refs: '^refs/tags/v[0-9.]+$'
-    actors: [alice]
+    publishers:
+      - repo: example/locked
+        signer_workflows: [example/locked/.github/workflows/release.yaml]
+        source_refs: '^refs/tags/v[0-9.]+$'
+        actors: [alice]
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -69,5 +76,23 @@ images:
 		if (err == nil) != c.ok {
 			t.Errorf("%s: allowed=%v, want %v (err: %v)", c.name, err == nil, c.ok, err)
 		}
+	}
+}
+
+func TestConfigRejectsUnknownFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "images.yaml")
+	if err := os.WriteFile(path, []byte(`
+source: ghcr.io/example
+destination: docker.io/example
+images:
+  app:
+    publishers:
+      - repo: example/app
+        source_ref: '^refs/tags/'
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadConfig(path); err == nil {
+		t.Fatal("a misspelt field (source_ref) was accepted, which would silently drop the restriction")
 	}
 }

@@ -101,24 +101,30 @@ defaults:
   allow_self_hosted: false   # accept attestations from self-hosted runners
 
 images:
-  # The repository that may publish this image.
-  my-image: example/my-repo
+  # Every image has the same shape: a list of publishers, each the
+  # repository that may publish it and the conditions it must meet.
+  my-image:
+    publishers:
+      - repo: example/my-repo
 
-  # Several publishers, each with its own conditions.
   shared-image:
-    - example/my-repo
-    - repo: example/builder
-      tags: '^nightly-'
+    publishers:
+      - repo: example/my-repo
+      - repo: example/builder
+        tags: '^nightly-'
 
-  # Stricter rules for one image.
   release-image:
-    repo: example/release-repo
-    source_refs: '^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'
-    signer_workflows:
-      - example/release-repo/.github/workflows/release.yaml
-    actors: [alice, bob]     # who triggered the attested run
-    tags: '^(v[0-9.]+|latest)$'
+    publishers:
+      - repo: example/release-repo
+        source_refs: '^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'
+        signer_workflows:
+          - example/release-repo/.github/workflows/release.yaml
+        actors: [alice, bob]     # who triggered the attested run
+        tags: '^(v[0-9.]+|latest)$'
 ```
+
+A request is allowed when one publisher allows all of it. Unknown fields are
+an error, so a misspelt restriction can't be silently ignored.
 
 | Publisher field | Meaning |
 | --- | --- |

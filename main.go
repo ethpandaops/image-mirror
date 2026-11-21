@@ -41,30 +41,16 @@ type config struct {
 		SourceRefs      string `yaml:"source_refs"`
 		AllowSelfHosted bool   `yaml:"allow_self_hosted"`
 	} `yaml:"defaults"`
-	// Images lists every image the mirror may publish and who may publish
-	// it. Anything else is refused.
-	Images map[string]publishers `yaml:"images"`
+	// Images lists every image the mirror may publish. Anything else is
+	// refused.
+	Images map[string]*image `yaml:"images"`
 }
 
-// publishers is one or more publisher rules. In YAML: a repo name, a list,
-// or a map (or list of maps) with stricter settings.
-type publishers []*publisher
-
-func (ps *publishers) UnmarshalYAML(n *yaml.Node) error {
-	if n.Kind == yaml.SequenceNode {
-		var list []*publisher
-		if err := n.Decode(&list); err != nil {
-			return err
-		}
-		*ps = list
-		return nil
-	}
-	var one publisher
-	if err := n.Decode(&one); err != nil {
-		return err
-	}
-	*ps = publishers{&one}
-	return nil
+// image is one allowlisted image.
+type image struct {
+	// Publishers are the repos that may publish the image, each under its
+	// own conditions. A request needs one publisher to allow all of it.
+	Publishers []*publisher `yaml:"publishers"`
 }
 
 // publisher says which repo may publish an image, and under which conditions.
@@ -78,15 +64,6 @@ type publisher struct {
 
 	sourceRefs *regexp.Regexp
 	tags       *regexp.Regexp
-}
-
-func (p *publisher) UnmarshalYAML(n *yaml.Node) error {
-	if n.Kind == yaml.ScalarNode {
-		p.Repo = n.Value
-		return nil
-	}
-	type plain publisher
-	return n.Decode((*plain)(p))
 }
 
 // allows is the early check on the HTTP path, from the caller's OIDC claims.
@@ -111,11 +88,11 @@ func (p *publisher) allows(cl githubClaims, tags []string) bool {
 }
 
 func (c *config) callerAllowed(image string, cl githubClaims, tags []string) error {
-	ps, ok := c.Images[image]
+	img, ok := c.Images[image]
 	if !ok {
 		return errors.New("image " + image + " is not in the mirror's allowlist")
 	}
-	for _, p := range ps {
+	for _, p := range img.Publishers {
 		if p.allows(cl, tags) {
 			return nil
 		}
@@ -125,7 +102,11 @@ func (c *config) callerAllowed(image string, cl githubClaims, tags []string) err
 
 // tagAllowed reports whether any publisher of image may publish tag.
 func (c *config) tagAllowed(image, tag string) bool {
-	for _, p := range c.Images[image] {
+	img := c.Images[image]
+	if img == nil {
+		return false
+	}
+	for _, p := range img.Publishers {
 		if p.tags == nil || p.tags.MatchString(tag) {
 			return true
 		}
@@ -232,25 +213,28 @@ func main() {
 }
 
 func loadConfig(path string) (*config, error) {
-	b, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
+	defer f.Close()
 	var c config
-	if err := yaml.Unmarshal(b, &c); err != nil {
+	dec := yaml.NewDecoder(f)
+	dec.KnownFields(true) // a misspelt restriction must fail, not be ignored
+	if err := dec.Decode(&c); err != nil {
 		return nil, err
 	}
 	if c.Source == "" || c.Destination == "" {
 		return nil, errors.New("source and destination are required")
 	}
-	for name, ps := range c.Images {
+	for name, img := range c.Images {
 		if !imageNameRe.MatchString(name) {
 			return nil, fmt.Errorf("invalid image name %q", name)
 		}
-		if len(ps) == 0 {
+		if img == nil || len(img.Publishers) == 0 {
 			return nil, fmt.Errorf("images.%s: no publishers", name)
 		}
-		for _, p := range ps {
+		for _, p := range img.Publishers {
 			if owner, repo, ok := strings.Cut(p.Repo, "/"); !ok || owner == "" || repo == "" || strings.Contains(repo, "/") {
 				return nil, fmt.Errorf("images.%s: repo must be <owner>/<name>", name)
 			}
@@ -423,7 +407,7 @@ func (s *server) mirror(ctx context.Context, image string, pairs []string, reque
 
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
-	rule, err := json.Marshal(s.cfg.Images[image])
+	rule, err := json.Marshal(s.cfg.Images[image].Publishers)
 	if err != nil {
 		return "", err
 	}
