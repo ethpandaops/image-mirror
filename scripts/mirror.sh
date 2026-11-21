@@ -94,6 +94,7 @@ def allowed($p):
     and ($p.repo_id == null or $c.sourceRepositoryIdentifier == ($p.repo_id | tostring))
     and ($c.sourceRepositoryRef | test($p.source_refs))
     and ($c.runnerEnvironment == "github-hosted" or $p.allow_self_hosted == true)
+    and (($p.events // []) == [] or any($p.events[]; . == $c.buildTrigger))
     and (if ($p.signer_workflows // []) == []
       then $c.subjectAlternativeName | ascii_downcase | startswith($repo + "/")
       else any($p.signer_workflows[]; . as $w

@@ -77,6 +77,9 @@ type publisher struct {
 	SignerWorkflows []string `yaml:"signer_workflows" json:"signer_workflows"`
 	SourceRefs      string   `yaml:"source_refs" json:"source_refs"`
 	Actors          []string `yaml:"actors" json:"actors"`
+	// Events limits the events that may have triggered the attested run
+	// (push, workflow_dispatch, pull_request_target, ...). Any when unset.
+	Events          []string `yaml:"events" json:"events"`
 	Tags            string   `yaml:"tags" json:"tags"`
 	AllowSelfHosted *bool    `yaml:"allow_self_hosted" json:"allow_self_hosted"`
 
@@ -98,6 +101,9 @@ func (p *publisher) allows(cl githubClaims, tags []string) bool {
 		return false
 	}
 	if len(p.Actors) > 0 && !contains(p.Actors, cl.Actor) {
+		return false
+	}
+	if len(p.Events) > 0 && !contains(p.Events, cl.EventName) {
 		return false
 	}
 	for _, t := range tags {
@@ -149,6 +155,7 @@ type githubClaims struct {
 	RepositoryID      string `json:"repository_id"`
 	Actor             string `json:"actor"`
 	Ref               string `json:"ref"`
+	EventName         string `json:"event_name"`
 	RunnerEnvironment string `json:"runner_environment"`
 	RunID             string `json:"run_id"`
 	RunAttempt        string `json:"run_attempt"`
@@ -183,6 +190,7 @@ var (
 	tagRe       = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$`)
 	digestRe    = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
 
+	eventRe          = regexp.MustCompile(`^[a-z_]+$`)
 	signerWorkflowRe = regexp.MustCompile(`^[^/@]+/[^/@]+/\.github/workflows/[^@]+$`)
 )
 
@@ -395,6 +403,11 @@ func loadConfig(path string) (*config, error) {
 			}
 			if p.RepoID < 0 {
 				return nil, fmt.Errorf("images.%s: invalid repo_id", name)
+			}
+			for _, e := range p.Events {
+				if !eventRe.MatchString(e) {
+					return nil, fmt.Errorf("images.%s: invalid event %q", name, e)
+				}
 			}
 			for _, w := range p.SignerWorkflows {
 				if !signerWorkflowRe.MatchString(w) {

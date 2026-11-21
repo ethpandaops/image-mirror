@@ -54,6 +54,13 @@ images:
         signer_workflows: [example/locked/.github/workflows/release.yaml]
         source_refs: '^refs/tags/v[0-9.]+$'
         actors: [alice]
+  gated:
+    publishers:
+      - repo: example/gated
+        events: [push, workflow_dispatch]
+      - repo: example/gated
+        events: [pull_request_target]
+        tags: 'pr-[0-9]+(-[0-9a-f]+)?'
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -69,32 +76,46 @@ images:
 		return githubClaims{Repository: repo, Ref: "refs/heads/master", RunnerEnvironment: "self-hosted"}
 	}
 
+	event := func(e string) githubClaims {
+		return githubClaims{Repository: "example/gated", Ref: "refs/heads/master", RunnerEnvironment: "github-hosted", EventName: e}
+	}
+
 	cases := []struct {
 		name  string
 		image string
 		cl    githubClaims
+		tags  []string
 		ok    bool
 	}{
-		{"listed repo", "app", hosted("example/app", "refs/heads/feature", ""), true},
-		{"another repo's image", "app", hosted("example/shared", "refs/heads/master", ""), false},
-		{"same-named new repo is not enough", "client", hosted("example/client", "refs/heads/master", ""), false},
-		{"unlisted image", "other", hosted("example/other", "refs/heads/master", ""), false},
-		{"second publisher, tag outside its pattern", "shared", hosted("example/builder", "refs/heads/master", ""), false},
-		{"first publisher", "shared", hosted("example/shared", "refs/heads/master", ""), true},
-		{"other org", "app", hosted("evil/app", "refs/heads/master", ""), false},
-		{"self-hosted by default", "app", selfHosted("example/app"), false},
-		{"self-hosted exception", "heavy", selfHosted("example/heavy"), true},
-		{"builder repo's image", "client-image", hosted("example/builder", "refs/heads/master", ""), true},
-		{"builder repo, unlisted image", "other", hosted("example/builder", "refs/heads/master", ""), false},
-		{"locked: release tag by allowed actor", "locked", hosted("example/locked", "refs/tags/v1.2.3", "alice"), true},
-		{"locked: branch build", "locked", hosted("example/locked", "refs/heads/master", "alice"), false},
-		{"locked: other actor", "locked", hosted("example/locked", "refs/tags/v1.2.3", "mallory"), false},
-		{"unanchored ref regex matches the whole ref", "pinned", hosted("example/pinned", "refs/heads/main", ""), true},
-		{"unanchored ref regex is not a prefix", "pinned", hosted("example/pinned", "refs/heads/main-evil", ""), false},
-		{"unanchored ref regex is not a suffix", "pinned", hosted("example/pinned", "refs/heads/x/refs/heads/main", ""), false},
+		{"listed repo", "app", hosted("example/app", "refs/heads/feature", ""), nil, true},
+		{"another repo's image", "app", hosted("example/shared", "refs/heads/master", ""), nil, false},
+		{"same-named new repo is not enough", "client", hosted("example/client", "refs/heads/master", ""), nil, false},
+		{"unlisted image", "other", hosted("example/other", "refs/heads/master", ""), nil, false},
+		{"second publisher, tag outside its pattern", "shared", hosted("example/builder", "refs/heads/master", ""), nil, false},
+		{"first publisher", "shared", hosted("example/shared", "refs/heads/master", ""), nil, true},
+		{"other org", "app", hosted("evil/app", "refs/heads/master", ""), nil, false},
+		{"self-hosted by default", "app", selfHosted("example/app"), nil, false},
+		{"self-hosted exception", "heavy", selfHosted("example/heavy"), nil, true},
+		{"builder repo's image", "client-image", hosted("example/builder", "refs/heads/master", ""), nil, true},
+		{"builder repo, unlisted image", "other", hosted("example/builder", "refs/heads/master", ""), nil, false},
+		{"locked: release tag by allowed actor", "locked", hosted("example/locked", "refs/tags/v1.2.3", "alice"), nil, true},
+		{"locked: branch build", "locked", hosted("example/locked", "refs/heads/master", "alice"), nil, false},
+		{"locked: other actor", "locked", hosted("example/locked", "refs/tags/v1.2.3", "mallory"), nil, false},
+		{"unanchored ref regex matches the whole ref", "pinned", hosted("example/pinned", "refs/heads/main", ""), nil, true},
+		{"unanchored ref regex is not a prefix", "pinned", hosted("example/pinned", "refs/heads/main-evil", ""), nil, false},
+		{"unanchored ref regex is not a suffix", "pinned", hosted("example/pinned", "refs/heads/x/refs/heads/main", ""), nil, false},
+		{"push may publish any tag", "gated", event("push"), []string{"master"}, true},
+		{"labelled PR build may publish pr tags", "gated", event("pull_request_target"), []string{"pr-343", "pr-343-abc1234"}, true},
+		{"labelled PR build may not publish branch tags", "gated", event("pull_request_target"), []string{"master"}, false},
+		{"labelled PR build may not mix in a branch tag", "gated", event("pull_request_target"), []string{"pr-343", "master"}, false},
+		{"unlisted event", "gated", event("schedule"), []string{"master"}, false},
 	}
 	for _, c := range cases {
-		err := cfg.callerAllowed(c.image, c.cl, []string{"latest"})
+		tags := c.tags
+		if tags == nil {
+			tags = []string{"latest"}
+		}
+		err := cfg.callerAllowed(c.image, c.cl, tags)
 		if (err == nil) != c.ok {
 			t.Errorf("%s: allowed=%v, want %v (err: %v)", c.name, err == nil, c.ok, err)
 		}

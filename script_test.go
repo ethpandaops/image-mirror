@@ -238,6 +238,28 @@ func TestScriptCopiesOnlyTheImage(t *testing.T) {
 	}
 }
 
+// A publisher limited to events only accepts attestations from runs those
+// events triggered: a labelled pull_request_target build of PR code, which
+// attests as the base branch, can't use a publisher meant for pushes.
+func TestScriptEvents(t *testing.T) {
+	f := newFakeTools(t)
+	d := f.image("master", "amd64")
+	f.attestTree(d, []string{"amd64"}, cert(map[string]any{"buildTrigger": "pull_request_target", "sourceRepositoryRef": "refs/heads/master"}))
+
+	pushOnly := "      - repo: example/app\n        events: [push]\n"
+	if out, err := f.run(pushOnly, "master@"+d); err == nil || f.copies() != "" {
+		t.Fatalf("a pull_request_target attestation passed a push-only publisher:\n%s", out)
+	}
+	prTags := "      - repo: example/app\n        events: [pull_request_target]\n        tags: 'pr-[0-9]+'\n"
+	if out, err := f.run(prTags, "master@"+d); err == nil || f.copies() != "" {
+		t.Fatalf("a PR build published a branch tag:\n%s", out)
+	}
+	f.set("digest", "src.example/img:pr-343", []byte(d))
+	if out, err := f.run(prTags, "pr-343@"+d); err != nil || f.copies() == "" {
+		t.Fatalf("a PR build couldn't publish its pr tag (err %v):\n%s", err, out)
+	}
+}
+
 // The poller runs with FILL_ONLY: re-pointing a source tag at another attested
 // digest (rolling latest back, say) must not move the destination tag.
 func TestScriptFillOnlyNeverMovesTags(t *testing.T) {
