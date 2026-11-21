@@ -153,6 +153,7 @@ the service and the verify script evaluate.
 | `actors` | GitHub logins allowed to have triggered the attested run. Both the user who started the run and the user who started the attested attempt must be listed. Any when unset. |
 | `events` | Events allowed to have triggered the attested run (`push`, `workflow_dispatch`, `pull_request_target`, ...). Any when unset. A `pull_request_target` run builds pull request code but attests as the base branch, so give it its own publisher entry limited to tags such as `pr-[0-9]+`. |
 | `tags` | Regex every whole requested tag must match. Any when unset. |
+| `exclude_tags` | Regex no whole requested tag may match, for rules a lookahead-free regex can't express, such as any tag except `latest`. None when unset. |
 | `allow_self_hosted` | Accept attestations made on self-hosted runners. Anyone who controls a runner that can pick up `repo`'s jobs can then publish the image. |
 
 `actors` is checked by looking up the attested run attempt, so pair it with a

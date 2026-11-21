@@ -83,12 +83,16 @@ type publisher struct {
 	Actors          []string `yaml:"actors" json:"actors"`
 	// Events limits the events that may have triggered the attested run
 	// (push, workflow_dispatch, pull_request_target, ...). Any when unset.
-	Events          []string `yaml:"events" json:"events"`
-	Tags            string   `yaml:"tags" json:"tags"`
-	AllowSelfHosted *bool    `yaml:"allow_self_hosted" json:"allow_self_hosted"`
+	Events []string `yaml:"events" json:"events"`
+	Tags   string   `yaml:"tags" json:"tags"`
+	// ExcludeTags refuses tags that Tags would allow, for rules RE2 can't
+	// express without lookahead, such as "any tag except latest".
+	ExcludeTags     string `yaml:"exclude_tags" json:"exclude_tags"`
+	AllowSelfHosted *bool  `yaml:"allow_self_hosted" json:"allow_self_hosted"`
 
-	sourceRefs *regexp.Regexp
-	tags       *regexp.Regexp
+	sourceRefs  *regexp.Regexp
+	tags        *regexp.Regexp
+	excludeTags *regexp.Regexp
 }
 
 // allows is the early check on the HTTP path, from the caller's OIDC claims.
@@ -111,11 +115,15 @@ func (p *publisher) allows(cl githubClaims, tags []string) bool {
 		return false
 	}
 	for _, t := range tags {
-		if p.tags != nil && !p.tags.MatchString(t) {
+		if !p.allowsTag(t) {
 			return false
 		}
 	}
 	return true
+}
+
+func (p *publisher) allowsTag(tag string) bool {
+	return (p.tags == nil || p.tags.MatchString(tag)) && (p.excludeTags == nil || !p.excludeTags.MatchString(tag))
 }
 
 // callerAllowed returns the same error whether or not the image is listed, so
@@ -138,7 +146,7 @@ func (c *config) tagAllowed(image, tag string) bool {
 		return false
 	}
 	for _, p := range img.Publishers {
-		if p.tags == nil || p.tags.MatchString(tag) {
+		if p.allowsTag(tag) {
 			return true
 		}
 	}
@@ -436,6 +444,12 @@ func loadConfig(path string) (*config, error) {
 				p.Tags = anchor(p.Tags)
 				if p.tags, err = regexp.Compile(p.Tags); err != nil {
 					return nil, fmt.Errorf("images.%s.tags: %w", name, err)
+				}
+			}
+			if p.ExcludeTags != "" {
+				p.ExcludeTags = anchor(p.ExcludeTags)
+				if p.excludeTags, err = regexp.Compile(p.ExcludeTags); err != nil {
+					return nil, fmt.Errorf("images.%s.exclude_tags: %w", name, err)
 				}
 			}
 		}

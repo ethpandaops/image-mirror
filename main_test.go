@@ -61,6 +61,11 @@ images:
       - repo: example/gated
         events: [pull_request_target]
         tags: 'pr-[0-9]+(-[0-9a-f]+)?'
+  dev:
+    publishers:
+      - repo: example/dev
+        tags: '[A-Za-z0-9_.-]+'
+        exclude_tags: '.*latest|v?[0-9].*'
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -109,6 +114,10 @@ images:
 		{"labelled PR build may not publish branch tags", "gated", event("pull_request_target"), []string{"master"}, false},
 		{"labelled PR build may not mix in a branch tag", "gated", event("pull_request_target"), []string{"pr-343", "master"}, false},
 		{"unlisted event", "gated", event("schedule"), []string{"master"}, false},
+		{"tag outside exclude_tags", "dev", hosted("example/dev", "refs/heads/feat", ""), []string{"feat-x", "feat-x-abc1234"}, true},
+		{"excluded tag", "dev", hosted("example/dev", "refs/heads/feat", ""), []string{"debian-latest"}, false},
+		{"excluded tag mixed in", "dev", hosted("example/dev", "refs/heads/feat", ""), []string{"feat-x", "v1.2.3"}, false},
+		{"exclude_tags matches the whole tag only", "dev", hosted("example/dev", "refs/heads/feat", ""), []string{"latest-feat"}, true},
 	}
 	for _, c := range cases {
 		tags := c.tags

@@ -136,7 +136,8 @@ authorise() {
 # One publisher must authorise the whole request: all tags and all digests.
 authorised=""
 while read -r pub; do
-  jq -n -e --argjson p "$pub" '($p.tags // "") as $re | $re == "" or ($ARGS.positional | all(test($re)))' \
+  jq -n -e --argjson p "$pub" '($p.tags // "") as $re | ($p.exclude_tags // "") as $ex
+    | ($re == "" or ($ARGS.positional | all(test($re)))) and ($ex == "" or ($ARGS.positional | all(test($ex) | not)))' \
     --args "${tags[@]}" >/dev/null 2>&1 || continue
   ok=1
   lines=()

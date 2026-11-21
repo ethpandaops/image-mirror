@@ -181,6 +181,8 @@ func TestScriptAuthorisation(t *testing.T) {
 		{"ref regex matches whole ref only", app + "        source_refs: refs/tags/v1\n", nil, "v1.0.0", false},
 		{"ref regex", app + "        source_refs: 'refs/tags/v.*'\n", nil, "v1.0.0", true},
 		{"tag regex matches whole tag only", app + "        tags: v1\n", nil, "v1.0.0", false},
+		{"excluded tag", app + "        exclude_tags: 'v.*'\n", nil, "v1.0.0", false},
+		{"exclude_tags matches whole tag only", app + "        exclude_tags: v1\n", nil, "v1.0.0", true},
 		{"self-hosted", app, map[string]any{"runnerEnvironment": "self-hosted"}, "v1.0.0", false},
 		{"self-hosted allowed", app + "        allow_self_hosted: true\n", map[string]any{"runnerEnvironment": "self-hosted"}, "v1.0.0", true},
 		{"repo id matches", app + "        repo_id: 1001\n", nil, "v1.0.0", true},
