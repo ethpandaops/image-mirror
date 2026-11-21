@@ -58,7 +58,7 @@ the audience configured with `-audience`:
 | `401` | Missing or invalid token. |
 | `403` | The calling repository, ref or runner may not publish this image. |
 | `422` | Verification or copy failed. The body says why. |
-| `429` | The calling repository already has 4 jobs queued or running, or the service has 32. Retry later. |
+| `429` | The calling repository already has `-max-jobs-per-repo` jobs queued or running, or the service has `-max-jobs`. Retry later. |
 
 The caller's token is checked first so bad requests fail fast, but the
 attestations are what authorise a copy. Copies run detached from the request,
@@ -175,6 +175,9 @@ split build) vouches for that other job's output.
 | `-listen` | `:8080` | HTTP listen address. |
 | `-audience` | `image-mirror` | Required OIDC audience. |
 | `-poll-interval` | `2m` | Poller interval; `0` disables it. |
+| `-poll-max-per-image` | `10` | Tags the poller verifies per image per cycle; the rest wait for later cycles. |
+| `-max-jobs-per-repo` | `4` | Mirror jobs a calling repository may have queued or running. |
+| `-max-jobs` | `32` | Mirror jobs queued or running in total. |
 | `-script` | `scripts/mirror.sh` | Verify-and-copy script. |
 
 ### Environment

@@ -272,7 +272,8 @@ func TestMirrorEndpoint(t *testing.T) {
 
 	// An allowed caller can only queue a few jobs at a time.
 	var ids []string
-	for range maxJobsPerRepo {
+	s.limits.jobsPerRepo = 3 // a non-default value, so the flag's value is what's enforced
+	for range s.limits.jobsPerRepo {
 		code, body := do("POST", "/v1/mirror", app, `{"image":"app","tags":[`+pair+`]}`)
 		if code != 202 {
 			t.Fatalf("POST: %d %s", code, body)

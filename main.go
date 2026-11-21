@@ -41,12 +41,9 @@ const githubIssuer = "https://token.actions.githubusercontent.com"
 // must be cheap, and allowed callers share one GitHub API rate limit and one
 // destination credential.
 const (
-	maxJobsPerRepo     = 4                // queued or running jobs per calling repository
-	maxJobs            = 32               // queued or running jobs in total
 	maxStoredJobs      = 1000             // finished jobs kept for GET /v1/jobs/{id}
 	jobRetention       = 15 * time.Minute // how long a finished job can be fetched
 	maxJobOutput       = 64 << 10         // bytes of script output kept per job
-	maxPollPerImage    = 10               // verifications per image per poll cycle
 	rejectedRetryAfter = time.Hour        // when the poller retries a refused digest
 	scriptTimeout      = 15 * time.Minute // one verify-and-copy run, after the image lock
 )
@@ -162,6 +159,7 @@ type server struct {
 	script     string
 	verifier   *oidc.IDTokenVerifier
 	inlineWait time.Duration // how long POST /v1/mirror waits before answering 202
+	limits     limits
 	// tokens mints GitHub API tokens when a GitHub App is configured;
 	// otherwise the script uses GH_TOKEN from the environment.
 	tokens *appTokens
@@ -194,7 +192,15 @@ func main() {
 	script := flag.String("script", "scripts/mirror.sh", "verify-and-copy script")
 	audience := flag.String("audience", "image-mirror", "required OIDC audience")
 	pollEvery := flag.Duration("poll-interval", 2*time.Minute, "poll interval, 0 disables polling")
+	lim := defaultLimits
+	flag.IntVar(&lim.jobsPerRepo, "max-jobs-per-repo", lim.jobsPerRepo, "queued or running mirror jobs per calling repository; more get 429")
+	flag.IntVar(&lim.jobs, "max-jobs", lim.jobs, "queued or running mirror jobs in total; more get 429")
+	flag.IntVar(&lim.pollPerImage, "poll-max-per-image", lim.pollPerImage, "tags the poller verifies per image per cycle")
 	flag.Parse()
+	if lim.jobsPerRepo < 1 || lim.jobs < 1 || lim.pollPerImage < 1 {
+		slog.Error("limits must be at least 1")
+		os.Exit(1)
+	}
 
 	cfg, err := loadConfig(*cfgPath)
 	if err != nil {
@@ -234,6 +240,7 @@ func main() {
 
 	s := newServer(cfg, *script, newVerifier(githubIssuer, *audience, &keySet{url: discovery.JWKSURL, client: client, minRefresh: time.Minute}))
 	s.tokens = tokens
+	s.limits = lim
 	if *pollEvery > 0 {
 		go s.pollLoop(*pollEvery)
 	}
@@ -254,12 +261,23 @@ func main() {
 	}
 }
 
+// limits caps the work callers and the poller can cause. Allowed callers
+// share one GitHub API rate limit and one destination credential.
+type limits struct {
+	jobsPerRepo  int // queued or running jobs per calling repository
+	jobs         int // queued or running jobs in total
+	pollPerImage int // verifications per image per poll cycle
+}
+
+var defaultLimits = limits{jobsPerRepo: 4, jobs: 32, pollPerImage: 10}
+
 func newServer(cfg *config, script string, verifier *oidc.IDTokenVerifier) *server {
 	return &server{
 		cfg:        cfg,
 		script:     script,
 		verifier:   verifier,
 		inlineWait: 25 * time.Second,
+		limits:     defaultLimits,
 		locks:      map[string]*sync.Mutex{},
 		jobs:       map[string]*job{},
 		current:    map[string]string{},
@@ -513,10 +531,10 @@ func (s *server) addJob(id string, j *job) error {
 			oldestID, oldest = k, old.end
 		}
 	}
-	if mine >= maxJobsPerRepo {
+	if mine >= s.limits.jobsPerRepo {
 		return fmt.Errorf("%s already has %d mirror jobs queued or running", j.repo, mine)
 	}
-	if running >= maxJobs {
+	if running >= s.limits.jobs {
 		return errors.New("too many mirror jobs queued or running")
 	}
 	if len(s.jobs) >= maxStoredJobs && oldestID != "" {
@@ -720,9 +738,9 @@ func (s *server) pollOnce(ctx context.Context) {
 
 		// Anyone who can push to the source package can add tags, so cap the
 		// verifications per image per cycle; the rest wait for later cycles.
-		if len(pairs) > maxPollPerImage {
-			log.Warn("many tags to verify; deferring some to later cycles", "pending", len(pairs), "this_cycle", maxPollPerImage)
-			pairs = pairs[:maxPollPerImage]
+		if len(pairs) > s.limits.pollPerImage {
+			log.Warn("many tags to verify; deferring some to later cycles", "pending", len(pairs), "this_cycle", s.limits.pollPerImage)
+			pairs = pairs[:s.limits.pollPerImage]
 		}
 		// Mirror tag by tag so one unverifiable tag does not block the rest.
 		for _, p := range pairs {
