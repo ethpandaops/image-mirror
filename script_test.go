@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -19,6 +20,7 @@ import (
 
 const fakeRegctl = `#!/usr/bin/env bash
 key() { printf '%s' "$1" | tr -c 'A-Za-z0-9' _; }
+echo "$*" >> "$FIX/regctl.log"
 case "$1 $2" in
   "registry "*|"tag ls") exit 0 ;;
   "image digest") cat "$FIX/digest/$(key "$3")" 2>/dev/null || { echo "not found: $3" >&2; exit 1; } ;;
@@ -326,5 +328,30 @@ func TestScriptBoundsUnverifiedManifests(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(filepath.Join(f.fix, "gh.log")); len(b) > 0 {
 		t.Fatalf("called gh before bounding the request:\n%s", b)
+	}
+}
+
+// An image with poll: false is never touched by the poller, so a tag per
+// commit doesn't make every cycle read every tag's digest.
+func TestPollerSkipsImagesWithPollOff(t *testing.T) {
+	f := newFakeTools(t)
+	f.image("v1.0.0", "amd64")
+	t.Setenv("PATH", f.bin+":"+os.Getenv("PATH"))
+	t.Setenv("FIX", f.fix)
+
+	path := filepath.Join(t.TempDir(), "images.yaml")
+	f.write(path, "source: src.example\ndestination: dest.example\nimages:\n  img:\n    poll: false\n    publishers:\n      - repo: example/app\n")
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newServer(cfg, "scripts/mirror.sh", nil)
+	s.pollOnce(context.Background())
+
+	if log, _ := os.ReadFile(filepath.Join(f.fix, "regctl.log")); len(log) != 0 {
+		t.Fatalf("the poller read a poll: false image:\n%s", log)
+	}
+	if f.copies() != "" {
+		t.Fatalf("the poller copied a poll: false image: %s", f.copies())
 	}
 }

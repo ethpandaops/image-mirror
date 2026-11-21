@@ -67,6 +67,10 @@ type image struct {
 	// Publishers are the repos that may publish the image, each under its
 	// own conditions. A request needs one publisher to allow all of it.
 	Publishers []*publisher `yaml:"publishers"`
+	// Poll is whether the background poller backfills this image. Turn it off
+	// for images whose tags grow without bound (a tag per commit): the poller
+	// reads every source tag's digest each cycle. Publish requests still work.
+	Poll *bool `yaml:"poll"`
 }
 
 // publisher says which repo may publish an image, and under which conditions.
@@ -716,6 +720,9 @@ func (s *server) pollOnce(ctx context.Context) {
 	}
 	sort.Strings(names)
 	for _, name := range names {
+		if p := s.cfg.Images[name].Poll; p != nil && !*p {
+			continue
+		}
 		log := slog.With("image", name, "path", "poll")
 		src := s.cfg.Source + "/" + name
 		dest := s.cfg.Destination + "/" + name

@@ -132,6 +132,11 @@ images:
         tags: 'v[0-9.]+|latest'
 ```
 
+Set `poll: false` on an image to keep the poller away from it. The poller reads
+the digest of every allowed source tag of every image each cycle, so an image
+that gains a tag per commit makes every cycle slower; with `poll: false` its
+tags only reach the destination through publish requests.
+
 A request is allowed when one publisher allows all of it. Unknown fields are
 an error, so a misspelt restriction can't be silently ignored. Regexes must
 match the whole ref or tag: `refs/heads/main` does not allow
