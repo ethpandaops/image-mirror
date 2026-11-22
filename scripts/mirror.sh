@@ -40,7 +40,14 @@ fi
 # Nothing below needs the registry credentials in its environment.
 unset SOURCE_TOKEN DESTINATION_TOKEN
 
-regctl tag ls --limit 1 "$dest" >/dev/null 2>&1 || fail "${dest} does not exist"
+# The destination repository must already exist. Listing tags is slow on
+# repositories with many tags (Docker Hub takes minutes, whatever the limit),
+# so a requested tag that already exists there answers first.
+dest_exists=""
+for tag in "${tags[@]}"; do
+  regctl image digest "${dest}:${tag}" >/dev/null 2>&1 && { dest_exists=1; break; }
+done
+[[ -n $dest_exists ]] || regctl tag ls --limit 1 "$dest" >/dev/null 2>&1 || fail "${dest} does not exist"
 
 # Every manifest behind every tag (index and per-platform manifests). This runs
 # before anything is verified, on content anyone who can push to the source

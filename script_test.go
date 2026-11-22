@@ -22,7 +22,8 @@ const fakeRegctl = `#!/usr/bin/env bash
 key() { printf '%s' "$1" | tr -c 'A-Za-z0-9' _; }
 echo "$*" >> "$FIX/regctl.log"
 case "$1 $2" in
-  "registry "*|"tag ls") exit 0 ;;
+  "registry "*) exit 0 ;;
+  "tag ls") [[ ! -e "$FIX/no-destination" ]] ;;
   "image digest") cat "$FIX/digest/$(key "$3")" 2>/dev/null || { echo "not found: $3" >&2; exit 1; } ;;
   "manifest get") cat "$FIX/manifest/$(key "${3#*@}")" ;;
   "image copy")
@@ -261,6 +262,26 @@ func TestScriptEvents(t *testing.T) {
 	f.set("digest", "src.example/img:pr-343", []byte(d))
 	if out, err := f.run(prTags, "pr-343@"+d); err != nil || f.copies() == "" {
 		t.Fatalf("a PR build couldn't publish its pr tag (err %v):\n%s", err, out)
+	}
+}
+
+// Listing tags takes minutes on big Docker Hub repositories, so a destination
+// that already has one of the requested tags isn't listed; one with none of
+// them must still exist.
+func TestScriptDestinationMustExist(t *testing.T) {
+	f := newFakeTools(t)
+	d := f.image("main", "amd64")
+	f.attestTree(d, []string{"amd64"}, cert(nil))
+	f.write(filepath.Join(f.fix, "no-destination"), "")
+	if out, err := f.run("      - repo: example/app\n", "main@"+d); err == nil || !strings.Contains(out, "does not exist") || f.copies() != "" {
+		t.Fatalf("copied to a missing destination (err %v):\n%s", err, out)
+	}
+	f.set("digest", "dest.example/img:main", []byte(digestOf("older build")))
+	if out, err := f.run("      - repo: example/app\n", "main@"+d); err != nil || f.copies() == "" {
+		t.Fatalf("an existing destination tag didn't count (err %v):\n%s", err, out)
+	}
+	if log, _ := os.ReadFile(filepath.Join(f.fix, "regctl.log")); strings.Count(string(log), "tag ls") != 1 {
+		t.Fatalf("listed destination tags although a requested tag exists:\n%s", log)
 	}
 }
 
