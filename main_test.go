@@ -17,9 +17,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/go-jose/go-jose/v4"
+	"github.com/redis/go-redis/v9"
 )
+
+func newTestRedis(t *testing.T) redis.UniversalClient {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { rdb.Close() })
+	return rdb
+}
 
 func TestCallerAllowed(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "images.yaml")
@@ -267,7 +276,7 @@ func TestMirrorEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := newServer(cfg, script, iss.verifier(time.Minute))
+	s := newServer(cfg, script, iss.verifier(time.Minute), newTestRedis(t))
 	s.inlineWait = 10 * time.Millisecond
 	srv := httptest.NewServer(s.routes())
 	defer srv.Close()
@@ -331,5 +340,119 @@ func TestMirrorEndpoint(t *testing.T) {
 	}
 	if code, body := do("POST", "/v1/mirror", app, `{"image":"app","tags":[`+pair+`]}`); code != 202 && code != 200 {
 		t.Fatalf("POST after jobs finished: %d %s", code, body)
+	}
+}
+
+// replicaTest runs several replicas against one Redis, each with its own
+// verify-and-copy script.
+type replicaTest struct {
+	t     *testing.T
+	iss   *testIssuer
+	rdb   redis.UniversalClient
+	cfg   *config
+	dir   string
+	token string
+	pair  string
+}
+
+func newReplicaTest(t *testing.T) *replicaTest {
+	rt := &replicaTest{t: t, iss: newTestIssuer(t), rdb: newTestRedis(t), dir: t.TempDir()}
+	cfgPath := filepath.Join(rt.dir, "images.yaml")
+	if err := os.WriteFile(cfgPath, []byte("source: s.example\ndestination: d.example\nimages:\n  app:\n    publishers:\n      - repo: example/app\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var err error
+	if rt.cfg, err = loadConfig(cfgPath); err != nil {
+		t.Fatal(err)
+	}
+	rt.token = rt.iss.token("k1", map[string]any{"repository": "example/app", "repository_id": "1001", "ref": "refs/heads/main", "runner_environment": "github-hosted", "run_id": "1", "run_attempt": "1"})
+	rt.pair = `"x@sha256:` + strings.Repeat("a", 64) + `"`
+	return rt
+}
+
+// replica starts a replica whose script runs body.
+func (rt *replicaTest) replica(name, body string) (*server, *httptest.Server) {
+	script := filepath.Join(rt.dir, name+".sh")
+	if err := os.WriteFile(script, []byte(body), 0o600); err != nil {
+		rt.t.Fatal(err)
+	}
+	s := newServer(rt.cfg, script, rt.iss.verifier(time.Minute), rt.rdb)
+	s.inlineWait = 10 * time.Millisecond
+	s.reapEvery = 50 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	go s.reapLoop(ctx)
+	srv := httptest.NewServer(s.routes())
+	rt.t.Cleanup(func() { cancel(); srv.Close(); s.cancelJobs(); s.jobsWG.Wait() })
+	return s, srv
+}
+
+func (rt *replicaTest) do(srv *httptest.Server, method, path, body string) (int, string) {
+	req, _ := http.NewRequest(method, srv.URL+path, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+rt.token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		rt.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, strings.TrimSpace(string(b))
+}
+
+// wait polls the job on srv until it finishes, as the mirror-image action
+// does: 202 and 5xx mean keep polling, anything else is the answer.
+func (rt *replicaTest) wait(srv *httptest.Server, id string) (int, string) {
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		code, body := rt.do(srv, "GET", "/v1/jobs/"+id, "")
+		if (code != 202 && code < 500) || time.Now().After(deadline) {
+			return code, body
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// A replica that is shutting down neither loses its running jobs nor turns
+// callers away: jobs it can't finish in time, and jobs it admits while
+// draining, run on another replica, and any replica answers for them.
+func TestDrainHandsJobsOver(t *testing.T) {
+	rt := newReplicaTest(t)
+	a, srvA := rt.replica("a", "sleep 30; echo from-a\n")
+	rt.replica("b", "echo from-b\n")
+	post := func() string {
+		code, body := rt.do(srvA, "POST", "/v1/mirror", `{"image":"app","tags":[`+rt.pair+`]}`)
+		if code != 202 {
+			t.Fatalf("POST: %d %s", code, body)
+		}
+		return body
+	}
+
+	a.draining.Store(true)
+	if code, body := rt.wait(srvA, post()); code != 200 || !strings.Contains(body, "from-b") {
+		t.Fatalf("job admitted while draining: %d %s", code, body)
+	}
+
+	a.draining.Store(false)
+	running := post()
+	time.Sleep(200 * time.Millisecond) // a is running it
+	a.draining.Store(true)
+	a.cancelJobs() // the drain timeout passes
+	if code, body := rt.wait(srvA, running); code != 200 || !strings.Contains(body, "from-b") {
+		t.Fatalf("job handed over: %d %s", code, body)
+	}
+}
+
+// The limits hold across replicas, not per replica.
+func TestLimitsAcrossReplicas(t *testing.T) {
+	rt := newReplicaTest(t)
+	a, srvA := rt.replica("a", "sleep 30\n")
+	b, srvB := rt.replica("b", "sleep 30\n")
+	a.limits.jobsPerRepo, b.limits.jobsPerRepo = 2, 2
+	for _, srv := range []*httptest.Server{srvA, srvB} {
+		if code, body := rt.do(srv, "POST", "/v1/mirror", `{"image":"app","tags":[`+rt.pair+`]}`); code != 202 {
+			t.Fatalf("POST: %d %s", code, body)
+		}
+	}
+	if code, body := rt.do(srvB, "POST", "/v1/mirror", `{"image":"app","tags":[`+rt.pair+`]}`); code != 429 {
+		t.Fatalf("third job across two replicas: %d %s", code, body)
 	}
 }

@@ -21,16 +21,20 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/go-jose/go-jose/v4"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/redis/go-redis/v9"
 	"gopkg.in/yaml.v3"
 )
 
@@ -41,7 +45,6 @@ const githubIssuer = "https://token.actions.githubusercontent.com"
 // must be cheap, and allowed callers share one GitHub API rate limit and one
 // destination credential.
 const (
-	maxStoredJobs      = 1000             // finished jobs kept for GET /v1/jobs/{id}
 	jobRetention       = 15 * time.Minute // how long a finished job can be fetched
 	maxJobOutput       = 64 << 10         // bytes of script output kept per job
 	rejectedRetryAfter = time.Hour        // when the poller retries a refused digest
@@ -183,11 +186,16 @@ type server struct {
 	// otherwise the script uses GH_TOKEN from the environment.
 	tokens *appTokens
 
-	jobsMu sync.Mutex
-	jobs   map[string]*job
+	rdb       redis.UniversalClient
+	replica   string        // this replica's lease token
+	reapEvery time.Duration // how often to look for jobs nobody holds
 
-	locksMu sync.Mutex
-	locks   map[string]*sync.Mutex
+	// jobsCtx ends when a draining replica gives up on its running jobs;
+	// jobsWG counts them and the poll cycle in progress.
+	jobsCtx    context.Context
+	cancelJobs context.CancelFunc
+	jobsWG     sync.WaitGroup
+	draining   atomic.Bool
 
 	// Poller memory: source digest last mirrored (or found current) per
 	// image:tag, and digests that failed verification, so a bad tag is not
@@ -208,6 +216,10 @@ var (
 
 func main() {
 	listen := flag.String("listen", ":8080", "HTTP listen address")
+	metricsListen := flag.String("metrics-listen", ":9090", "Prometheus metrics listen address, empty to disable")
+	redisAddrs := flag.String("redis-addrs", "localhost:6379", "comma-separated Redis addresses; Sentinel addresses with -redis-master")
+	redisMaster := flag.String("redis-master", "", "Sentinel master name, empty for a single Redis")
+	drainTimeout := flag.Duration("drain-timeout", 10*time.Minute, "on shutdown, how long running jobs may finish before they are left for another replica")
 	cfgPath := flag.String("config", "images.yaml", "allowlist file")
 	script := flag.String("script", "scripts/mirror.sh", "verify-and-copy script")
 	audience := flag.String("audience", "image-mirror", "required OIDC audience")
@@ -258,11 +270,35 @@ func main() {
 		os.Exit(1)
 	}
 
-	s := newServer(cfg, *script, newVerifier(githubIssuer, *audience, &keySet{url: discovery.JWKSURL, client: client, minRefresh: time.Minute}))
+	// REDIS_PASSWORD authenticates to Redis and, with -redis-master, to Sentinel.
+	rdb := redis.NewUniversalClient(&redis.UniversalOptions{
+		Addrs:            strings.Split(*redisAddrs, ","),
+		MasterName:       *redisMaster,
+		Password:         os.Getenv("REDIS_PASSWORD"),
+		SentinelPassword: os.Getenv("REDIS_PASSWORD"),
+	})
+	if err := rdb.Ping(context.Background()).Err(); err != nil {
+		slog.Error("redis", "err", err)
+		os.Exit(1)
+	}
+
+	s := newServer(cfg, *script, newVerifier(githubIssuer, *audience, &keySet{url: discovery.JWKSURL, client: client, minRefresh: time.Minute}), rdb)
 	s.tokens = tokens
 	s.limits = lim
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	bg, stopBg := context.WithCancel(context.Background())
+	go s.reapLoop(bg)
 	if *pollEvery > 0 {
-		go s.pollLoop(*pollEvery)
+		go s.pollLoop(bg, *pollEvery)
+	}
+	if *metricsListen != "" {
+		go func() {
+			mux := http.NewServeMux()
+			mux.Handle("GET /metrics", promhttp.Handler())
+			slog.Error("metrics", "err", http.ListenAndServe(*metricsListen, mux))
+		}()
 	}
 
 	srv := &http.Server{
@@ -274,11 +310,40 @@ func main() {
 		IdleTimeout:       time.Minute,
 		MaxHeaderBytes:    16 << 10,
 	}
-	slog.Info("listening", "addr", *listen, "destination", cfg.Destination, "images", len(cfg.Images), "poll", pollEvery.String())
-	if err := srv.ListenAndServe(); err != nil {
-		slog.Error("serve", "err", err)
-		os.Exit(1)
+	slog.Info("listening", "addr", *listen, "destination", cfg.Destination, "images", len(cfg.Images), "poll", pollEvery.String(), "replica", s.replica)
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("serve", "err", err)
+			os.Exit(1)
+		}
+	}()
+
+	<-ctx.Done()
+	s.drain(*drainTimeout)
+	stopBg()
+	sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(sctx)
+}
+
+// drain stops this replica taking work and waits for its running jobs. The
+// replica stays reachable meanwhile: it still answers job status from Redis
+// and admits new jobs, which other replicas run. Jobs still running after
+// timeout are stopped and left for another replica to resume.
+func (s *server) drain(timeout time.Duration) {
+	s.draining.Store(true)
+	draining.Set(1)
+	slog.Info("draining", "timeout", timeout)
+	done := make(chan struct{})
+	go func() { s.jobsWG.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		slog.Warn("drain timeout; handing running jobs over")
+		s.cancelJobs()
+		<-done
 	}
+	slog.Info("drained")
 }
 
 // limits caps the work callers and the poller can cause. Allowed callers
@@ -291,15 +356,20 @@ type limits struct {
 
 var defaultLimits = limits{jobsPerRepo: 4, jobs: 32, pollPerImage: 10}
 
-func newServer(cfg *config, script string, verifier *oidc.IDTokenVerifier) *server {
+func newServer(cfg *config, script string, verifier *oidc.IDTokenVerifier, rdb redis.UniversalClient) *server {
+	host, _ := os.Hostname()
+	jobsCtx, cancelJobs := context.WithCancel(context.Background())
 	return &server{
 		cfg:        cfg,
 		script:     script,
 		verifier:   verifier,
 		inlineWait: 25 * time.Second,
 		limits:     defaultLimits,
-		locks:      map[string]*sync.Mutex{},
-		jobs:       map[string]*job{},
+		rdb:        rdb,
+		replica:    host + "-" + randomHex(4),
+		reapEvery:  5 * time.Second,
+		jobsCtx:    jobsCtx,
+		cancelJobs: cancelJobs,
 		current:    map[string]string{},
 		rejected:   map[string]time.Time{},
 	}
@@ -311,9 +381,22 @@ func newVerifier(issuer, audience string, keys oidc.KeySet) *oidc.IDTokenVerifie
 
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/mirror", s.handleMirror)
-	mux.HandleFunc("GET /v1/jobs/{id}", s.handleJob)
+	mux.Handle("POST /v1/mirror", counted("mirror", s.handleMirror))
+	mux.Handle("GET /v1/jobs/{id}", counted("job", s.handleJob))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	// Ready while Redis answers and the replica isn't draining, so a rollout
+	// moves new requests to the other replicas first.
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		if s.draining.Load() {
+			http.Error(w, "draining", http.StatusServiceUnavailable)
+			return
+		}
+		if err := s.rdb.Ping(r.Context()).Err(); err != nil {
+			http.Error(w, "redis unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
 	return mux
 }
 
@@ -499,80 +582,49 @@ func (s *server) handleMirror(w http.ResponseWriter, r *http.Request) {
 
 	// The copy runs detached from the request, so a dropped connection or a
 	// proxy timeout does not abort it. Short jobs answer inline; longer ones
-	// answer 202 with a job ID to poll.
+	// answer 202 with a job ID any replica can answer for.
 	id := randomHex(16)
-	j := &job{repo: strings.ToLower(claims.Repository), repoID: claims.RepositoryID, start: start, done: make(chan struct{})}
-	if err := s.addJob(id, j); err != nil {
-		log.Warn("mirror request refused", "err", err)
-		w.Header().Set("Retry-After", "30")
-		http.Error(w, err.Error(), http.StatusTooManyRequests)
+	rec := jobRecord{
+		Image: req.Image, Pairs: strings.Join(req.Tags, " "), RequestID: requestID,
+		Repo: strings.ToLower(claims.Repository), RepoID: claims.RepositoryID,
+		State: "running", Start: start,
+	}
+	// A draining replica still admits, but leaves the job to the others.
+	own := !s.draining.Load()
+	if err := s.admit(r.Context(), id, rec, own); err != nil {
+		var busy busyError
+		if errors.As(err, &busy) {
+			log.Warn("mirror request refused", "err", err)
+			w.Header().Set("Retry-After", "30")
+			http.Error(w, err.Error(), http.StatusTooManyRequests)
+			return
+		}
+		log.Error("admitting job", "err", err)
+		http.Error(w, "mirror unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	log.Info("mirror request", "tags", req.Tags)
-	go func() {
-		out, err := s.mirror(context.Background(), req.Image, req.Tags, requestID, false)
-		s.jobsMu.Lock()
-		j.out, j.err, j.end = out, err, time.Now()
-		s.jobsMu.Unlock()
-		if err != nil {
-			log.Warn("mirror failed", "err", err, "elapsed", j.end.Sub(start).Round(time.Millisecond))
-		} else {
-			log.Info("mirror done", "elapsed", j.end.Sub(start).Round(time.Millisecond))
+	log.Info("mirror request", "job", id, "tags", req.Tags)
+	if own {
+		s.jobsWG.Add(1)
+		go s.runJob(id, rec)
+	}
+
+	deadline := time.Now().Add(s.inlineWait)
+	for {
+		got, ok, err := s.loadJob(r.Context(), id)
+		if err == nil && ok && got.State != "running" {
+			writeJob(w, got)
+			return
 		}
-		close(j.done)
-	}()
-
-	select {
-	case <-j.done:
-		writeJob(w, j)
-	case <-time.After(s.inlineWait):
-		w.Header().Set("Location", "/v1/jobs/"+id)
-		w.WriteHeader(http.StatusAccepted)
-		fmt.Fprintln(w, id)
-	}
-}
-
-type job struct {
-	repo, repoID string
-	start, end   time.Time
-	out          string
-	err          error
-	done         chan struct{}
-}
-
-// addJob stores j, or refuses it when its repository or the whole service
-// already has too many jobs queued or running. Finished jobs are dropped
-// after jobRetention, or oldest first once maxStoredJobs are kept.
-func (s *server) addJob(id string, j *job) error {
-	s.jobsMu.Lock()
-	defer s.jobsMu.Unlock()
-	running, mine := 0, 0
-	var oldestID string
-	var oldest time.Time
-	for k, old := range s.jobs {
-		switch {
-		case old.end.IsZero():
-			running++
-			if old.repo == j.repo {
-				mine++
-			}
-		case time.Since(old.end) > jobRetention:
-			delete(s.jobs, k)
-		case oldestID == "" || old.end.Before(oldest):
-			oldestID, oldest = k, old.end
+		left := time.Until(deadline)
+		if left <= 0 || r.Context().Err() != nil {
+			break
 		}
+		time.Sleep(min(left, 200*time.Millisecond))
 	}
-	if mine >= s.limits.jobsPerRepo {
-		return fmt.Errorf("%s already has %d mirror jobs queued or running", j.repo, mine)
-	}
-	if running >= s.limits.jobs {
-		return errors.New("too many mirror jobs queued or running")
-	}
-	if len(s.jobs) >= maxStoredJobs && oldestID != "" {
-		delete(s.jobs, oldestID)
-	}
-	s.jobs[id] = j
-	return nil
+	w.Header().Set("Location", "/v1/jobs/"+id)
+	w.WriteHeader(http.StatusAccepted)
+	fmt.Fprintln(w, id)
 }
 
 func (s *server) handleJob(w http.ResponseWriter, r *http.Request) {
@@ -580,29 +632,50 @@ func (s *server) handleJob(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	s.jobsMu.Lock()
-	j := s.jobs[r.PathValue("id")]
-	s.jobsMu.Unlock()
-	if j == nil || j.repo != strings.ToLower(claims.Repository) || j.repoID != claims.RepositoryID {
+	rec, ok, err := s.loadJob(r.Context(), r.PathValue("id"))
+	if err != nil {
+		// 5xx: callers keep polling.
+		http.Error(w, "mirror unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if !ok || rec.Repo != strings.ToLower(claims.Repository) || rec.RepoID != claims.RepositoryID {
 		http.Error(w, "no such job", http.StatusNotFound)
 		return
 	}
-	select {
-	case <-j.done:
-		writeJob(w, j)
-	default:
+	if rec.State == "running" {
 		w.WriteHeader(http.StatusAccepted)
 		fmt.Fprintln(w, "running")
-	}
-}
-
-func writeJob(w http.ResponseWriter, j *job) {
-	elapsed := j.end.Sub(j.start).Round(time.Millisecond)
-	if j.err != nil {
-		http.Error(w, fmt.Sprintf("%smirror failed after %s", j.out, elapsed), http.StatusUnprocessableEntity)
 		return
 	}
-	fmt.Fprintf(w, "%smirrored in %s\n", j.out, elapsed)
+	writeJob(w, rec)
+}
+
+func writeJob(w http.ResponseWriter, rec jobRecord) {
+	elapsed := rec.End.Sub(rec.Start).Round(time.Millisecond)
+	if rec.State == "failed" {
+		http.Error(w, fmt.Sprintf("%smirror failed after %s", rec.Out, elapsed), http.StatusUnprocessableEntity)
+		return
+	}
+	fmt.Fprintf(w, "%smirrored in %s\n", rec.Out, elapsed)
+}
+
+// counted records each response's status code.
+func counted(route string, h http.HandlerFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sw := &statusWriter{ResponseWriter: w, code: http.StatusOK}
+		h(sw, r)
+		httpRequests.WithLabelValues(route, strconv.Itoa(sw.code)).Inc()
+	})
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	code int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.code = code
+	w.ResponseWriter.WriteHeader(code)
 }
 
 // authenticate verifies the request's GitHub OIDC token.
@@ -628,9 +701,11 @@ func (s *server) authenticate(w http.ResponseWriter, r *http.Request) (githubCla
 // mirror runs the verify-and-copy script. With fillOnly, it only creates
 // destination tags that don't exist; it never moves an existing one.
 func (s *server) mirror(ctx context.Context, image string, pairs []string, requestID string, fillOnly bool) (string, error) {
-	lock := s.lock(image)
-	lock.Lock()
-	defer lock.Unlock()
+	ctx, unlock, err := s.lockImage(ctx, image)
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
 
 	ctx, cancel := context.WithTimeout(ctx, scriptTimeout)
 	defer cancel()
@@ -701,19 +776,44 @@ func (c *cappedBuffer) String() string {
 	return string(c.b)
 }
 
-func (s *server) lock(image string) *sync.Mutex {
-	s.locksMu.Lock()
-	defer s.locksMu.Unlock()
-	if s.locks[image] == nil {
-		s.locks[image] = &sync.Mutex{}
-	}
-	return s.locks[image]
-}
-
-func (s *server) pollLoop(every time.Duration) {
+// pollLoop runs the poller on one replica at a time: whichever holds the
+// poller lease, which it keeps until it drains or loses Redis.
+func (s *server) pollLoop(ctx context.Context, every time.Duration) {
+	const key = keyPrefix + "poller"
+	var lctx context.Context
+	var release func()
+	defer func() {
+		if release != nil {
+			release()
+		}
+		pollerLeader.Set(0)
+	}()
 	for {
-		s.pollOnce(context.Background())
-		time.Sleep(every)
+		if lctx != nil && lctx.Err() != nil {
+			release()
+			lctx, release = nil, nil
+			pollerLeader.Set(0)
+		}
+		if s.draining.Load() {
+			return
+		}
+		if lctx == nil && s.tryAcquire(ctx, key) {
+			lctx, release = s.hold(ctx, key)
+			pollerLeader.Set(1)
+			slog.Info("running the poller")
+		}
+		if lctx != nil {
+			s.jobsWG.Add(1)
+			start := time.Now()
+			s.pollOnce(lctx)
+			pollCycles.Observe(time.Since(start).Seconds())
+			s.jobsWG.Done()
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(every):
+		}
 	}
 }
 
@@ -734,6 +834,9 @@ func (s *server) pollOnce(ctx context.Context) {
 	}
 	sort.Strings(names)
 	for _, name := range names {
+		if ctx.Err() != nil || s.draining.Load() {
+			return
+		}
 		if p := s.cfg.Images[name].Poll; p != nil && !*p {
 			continue
 		}
@@ -795,6 +898,10 @@ func (s *server) pollOnce(ctx context.Context) {
 		for _, p := range pairs {
 			start := time.Now()
 			out, err := s.mirror(ctx, name, []string{p}, "poll-"+randomHex(4), true)
+			if ctx.Err() != nil {
+				return
+			}
+			observeJob(name, "poll", out, err, time.Since(start))
 			if err != nil {
 				_, digest, _ := strings.Cut(p, "@")
 				s.stateMu.Lock()

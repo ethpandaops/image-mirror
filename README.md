@@ -190,6 +190,10 @@ split build) vouches for that other job's output.
 | `-max-jobs-per-repo` | `4` | Mirror jobs a calling repository may have queued or running. |
 | `-max-jobs` | `32` | Mirror jobs queued or running in total. |
 | `-script` | `scripts/mirror.sh` | Verify-and-copy script. |
+| `-redis-addrs` | `localhost:6379` | Comma-separated Redis addresses, or Sentinel addresses with `-redis-master`. |
+| `-redis-master` | | Sentinel master name; empty for a single Redis. |
+| `-drain-timeout` | `10m` | On SIGTERM, how long running jobs may finish before they are left for another replica. |
+| `-metrics-listen` | `:9090` | Prometheus `GET /metrics` listen address; empty disables it. |
 
 ### Environment
 
@@ -199,6 +203,7 @@ split build) vouches for that other job's output.
 | `GH_TOKEN` | Instead of a GitHub App: a static read-only GitHub token. |
 | `DESTINATION_USERNAME`, `DESTINATION_TOKEN` | Push credential for the destination registry. |
 | `SOURCE_USERNAME`, `SOURCE_TOKEN` | Optional, to read private source images. |
+| `REDIS_PASSWORD` | Optional password for Redis and, with `-redis-master`, Sentinel. |
 
 Credentials are passed to `regctl` on stdin, never as arguments.
 
@@ -215,7 +220,7 @@ docker run --rm -p 8080:8080 \
   -e GITHUB_APP_ID -e GITHUB_APP_INSTALLATION_ID -e GITHUB_APP_PRIVATE_KEY_FILE=/secrets/app.pem \
   -e DESTINATION_USERNAME -e DESTINATION_TOKEN \
   ghcr.io/ethpandaops/image-mirror:latest \
-  -config /config/images.yaml
+  -config /config/images.yaml -redis-addrs redis:6379
 ```
 
 Each image has a build provenance attestation:
@@ -225,7 +230,8 @@ gh attestation verify oci://ghcr.io/ethpandaops/image-mirror@sha256:… --repo e
 ```
 
 The container runs as UID 10001, includes pinned, checksummed `gh`, `regctl`
-and `jq`, and serves `GET /healthz`. It needs a writable home directory and
+and `jq`, and serves `GET /healthz` (liveness) and `GET /readyz` (ready while
+Redis answers and it isn't draining). It needs a writable home directory and
 `/tmp` (`regctl` keeps its registry logins in `~/.regctl`). It serves plain
 HTTP: put it behind a proxy that terminates TLS. To build it yourself:
 
@@ -234,9 +240,26 @@ docker build -t image-mirror .
 ```
 
 On Kubernetes, mount the allowlist from a ConfigMap, the App key as a file and
-the destination credential from a Secret, and point a liveness probe at `/healthz`. Run one replica: jobs and the
-poller's state live in memory, and two replicas would poll and copy the same
-tags.
+the destination credential from a Secret, and point the liveness probe at
+`/healthz` and the readiness probe at `/readyz`.
+
+### Several replicas
+
+Replicas share jobs, per-repository limits, per-image locks and the poller
+through Redis, so any number can run behind one Service:
+
+- Any replica admits a request, answers `GET /v1/jobs/{id}` for any job, and
+  runs jobs. Only one replica at a time copies a given image, and only one
+  runs the poller.
+- A replica that stops renewing its leases (a crash, a lost node) loses its
+  jobs after 30 seconds, and another replica resumes them. Every copy is pinned
+  to a digest, so running a job again is safe.
+- On SIGTERM a replica turns unready and stops taking jobs, but keeps answering
+  and admitting (other replicas run what it admits). Running jobs get
+  `-drain-timeout` to finish, then are left for another replica. Give the pod a
+  termination grace period longer than `-drain-timeout`.
+- A job is lost only if Redis loses its record; run Redis with persistence, and
+  Sentinel for failover.
 
 ## Development
 

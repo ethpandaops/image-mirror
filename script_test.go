@@ -368,7 +368,7 @@ func TestPollerSkipsImagesWithPollOff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := newServer(cfg, "scripts/mirror.sh", nil)
+	s := newServer(cfg, "scripts/mirror.sh", nil, newTestRedis(t))
 	s.pollOnce(context.Background())
 
 	if log, _ := os.ReadFile(filepath.Join(f.fix, "regctl.log")); len(log) != 0 {
