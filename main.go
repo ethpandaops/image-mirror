@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -92,6 +93,12 @@ type publisher struct {
 	// express without lookahead, such as "any tag except latest".
 	ExcludeTags     string `yaml:"exclude_tags" json:"exclude_tags"`
 	AllowSelfHosted *bool  `yaml:"allow_self_hosted" json:"allow_self_hosted"`
+	// RequireAttestation false accepts the publishing job's word instead of
+	// attestations, for repositories that can't create them (private
+	// repositories on GitHub Free): the job's authenticated identity has to
+	// match this publisher, and the digests it sends are copied. Only
+	// publish requests can use it, never the poller.
+	RequireAttestation *bool `yaml:"require_attestation" json:"require_attestation"`
 
 	sourceRefs  *regexp.Regexp
 	tags        *regexp.Regexp
@@ -103,6 +110,11 @@ type publisher struct {
 // actually authorises a copy.
 func (p *publisher) allows(cl githubClaims, tags []string) bool {
 	if !strings.EqualFold(cl.Repository, p.Repo) || !p.sourceRefs.MatchString(cl.Ref) {
+		return false
+	}
+	if len(p.SignerWorkflows) > 0 && !slices.ContainsFunc(p.SignerWorkflows, func(w string) bool {
+		return strings.HasPrefix(cl.JobWorkflowRef, w+"@")
+	}) {
 		return false
 	}
 	if p.RepoID != 0 && cl.RepositoryID != strconv.FormatInt(p.RepoID, 10) {
@@ -125,6 +137,8 @@ func (p *publisher) allows(cl githubClaims, tags []string) bool {
 	return true
 }
 
+func (p *publisher) attested() bool { return p.RequireAttestation == nil || *p.RequireAttestation }
+
 func (p *publisher) allowsTag(tag string) bool {
 	return (p.tags == nil || p.tags.MatchString(tag)) && (p.excludeTags == nil || !p.excludeTags.MatchString(tag))
 }
@@ -142,14 +156,30 @@ func (c *config) callerAllowed(image string, cl githubClaims, tags []string) err
 	return fmt.Errorf("%s (ref %s, %s runner) may not publish these tags of %s", cl.Repository, cl.Ref, cl.RunnerEnvironment, image)
 }
 
-// tagAllowed reports whether any publisher of image may publish tag.
+// callerTrusted reports whether only publishers that don't require
+// attestations allow this caller, so the job's own identity authorises it.
+func (c *config) callerTrusted(image string, cl githubClaims, tags []string) bool {
+	trusted := false
+	for _, p := range c.Images[image].Publishers {
+		if p.allows(cl, tags) {
+			if p.attested() {
+				return false
+			}
+			trusted = true
+		}
+	}
+	return trusted
+}
+
+// tagAllowed reports whether any publisher of image may publish tag through
+// the poller, which has only attestations to go on.
 func (c *config) tagAllowed(image, tag string) bool {
 	img := c.Images[image]
 	if img == nil {
 		return false
 	}
 	for _, p := range img.Publishers {
-		if p.allowsTag(tag) {
+		if p.attested() && p.allowsTag(tag) {
 			return true
 		}
 	}
@@ -171,6 +201,7 @@ type githubClaims struct {
 	Actor             string `json:"actor"`
 	Ref               string `json:"ref"`
 	EventName         string `json:"event_name"`
+	JobWorkflowRef    string `json:"job_workflow_ref"`
 	RunnerEnvironment string `json:"runner_environment"`
 	RunID             string `json:"run_id"`
 	RunAttempt        string `json:"run_attempt"`
@@ -521,6 +552,9 @@ func loadConfig(path string) (*config, error) {
 			if p.SourceRefs == "" {
 				p.SourceRefs = ".*"
 			}
+			if !p.attested() && (p.RepoID == 0 || len(p.SignerWorkflows) == 0) {
+				return nil, fmt.Errorf("images.%s: require_attestation: false needs repo_id and signer_workflows", name)
+			}
 			if p.AllowSelfHosted == nil {
 				v := c.Defaults.AllowSelfHosted
 				p.AllowSelfHosted = &v
@@ -594,6 +628,7 @@ func (s *server) handleMirror(w http.ResponseWriter, r *http.Request) {
 		Image: req.Image, Pairs: strings.Join(req.Tags, " "), RequestID: requestID,
 		Repo: strings.ToLower(claims.Repository), RepoID: claims.RepositoryID,
 		State: "running", Start: start,
+		Trust: s.cfg.callerTrusted(req.Image, claims, tags),
 	}
 	// A draining replica still admits, but leaves the job to the others.
 	own := !s.draining.Load()
@@ -706,7 +741,7 @@ func (s *server) authenticate(w http.ResponseWriter, r *http.Request) (githubCla
 
 // mirror runs the verify-and-copy script. With fillOnly, it only creates
 // destination tags that don't exist; it never moves an existing one.
-func (s *server) mirror(ctx context.Context, image string, pairs []string, requestID string, fillOnly bool) (string, error) {
+func (s *server) mirror(ctx context.Context, image string, pairs []string, requestID string, fillOnly, trustCaller bool) (string, error) {
 	ctx, unlock, err := s.lockImage(ctx, image)
 	if err != nil {
 		return "", err
@@ -715,7 +750,19 @@ func (s *server) mirror(ctx context.Context, image string, pairs []string, reque
 
 	ctx, cancel := context.WithTimeout(ctx, scriptTimeout)
 	defer cancel()
-	rule, err := json.Marshal(s.cfg.Images[image].Publishers)
+	// The script sees only the publishers that can authorise this run:
+	// those that require attestations, or, for a trusted caller, those that
+	// don't.
+	var pubs []*publisher
+	for _, p := range s.cfg.Images[image].Publishers {
+		if p.attested() != trustCaller {
+			pubs = append(pubs, p)
+		}
+	}
+	if len(pubs) == 0 {
+		return "no publisher can authorise this request\n", errors.New("no matching publishers")
+	}
+	rule, err := json.Marshal(pubs)
 	if err != nil {
 		return "", err
 	}
@@ -737,6 +784,7 @@ func (s *server) mirror(ctx context.Context, image string, pairs []string, reque
 		"TAGS="+strings.Join(pairs, " "),
 		"REQUEST_ID="+requestID,
 		"FILL_ONLY="+strconv.FormatBool(fillOnly),
+		"TRUST_CALLER="+strconv.FormatBool(trustCaller),
 	)
 	cmd.Stdout, cmd.Stderr = out, out
 	// On timeout, kill the script's whole process group, not just bash, so
@@ -909,7 +957,7 @@ func (s *server) pollOnce(ctx context.Context) {
 		// Mirror tag by tag so one unverifiable tag does not block the rest.
 		for _, p := range pairs {
 			start := time.Now()
-			out, err := s.mirror(ctx, name, []string{p}, "poll-"+randomHex(4), true)
+			out, err := s.mirror(ctx, name, []string{p}, "poll-"+randomHex(4), true, false)
 			if ctx.Err() != nil {
 				return
 			}

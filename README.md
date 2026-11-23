@@ -149,11 +149,12 @@ the service and the verify script evaluate.
 | `repo` | `owner/name` of the repository whose attestations count. |
 | `repo_id` | Numeric ID of `repo`. When set, attestations and callers must come from the repository with this ID as well as this name, so a repository deleted or renamed and then recreated under the same name, or an owner name taken over, cannot publish. Recommended. |
 | `source_refs` | Regex the whole attested ref must match. Defaults to `defaults.source_refs`. |
-| `signer_workflows` | Workflow files (`owner/repo/.github/workflows/file`) allowed to have signed the attestation, matched exactly. Any workflow in `repo` when unset. |
+| `signer_workflows` | Workflow files (`owner/repo/.github/workflows/file`) allowed to have signed the attestation and to make the request (the caller token's `job_workflow_ref`), matched exactly. Any workflow in `repo` when unset. |
 | `actors` | GitHub logins allowed to have triggered the attested run. Both the user who started the run and the user who started the attested attempt must be listed. Any when unset. |
 | `events` | Events allowed to have triggered the attested run (`push`, `workflow_dispatch`, `pull_request_target`, ...). Any when unset. A `pull_request_target` run builds pull request code but attests as the base branch, so give it its own publisher entry limited to tags such as `pr-[0-9]+`. |
 | `tags` | Regex every whole requested tag must match. Any when unset. |
 | `exclude_tags` | Regex no whole requested tag may match, for rules a lookahead-free regex can't express, such as any tag except `latest`. None when unset. |
+| `require_attestation` | Default `true`. `false` accepts a publish request from the publishing job's authenticated identity alone, for repositories that can't create attestations (private repositories on GitHub Free). The job must match `repo_id` and `signer_workflows` (both required then) and the other fields, and the digests it sends are copied. The poller never fills such tags. |
 | `allow_self_hosted` | Accept attestations made on self-hosted runners. Anyone who controls a runner that can pick up `repo`'s jobs can then publish the image. |
 
 `actors` is checked by looking up the attested run attempt, so pair it with a

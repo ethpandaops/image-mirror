@@ -77,6 +77,15 @@ images:
       - repo: example/dev
         tags: '[A-Za-z0-9_.-]+'
         exclude_tags: '.*latest|v?[0-9].*'
+  private:
+    publishers:
+      - repo: example/private
+        repo_id: 3003
+        signer_workflows: [example/private/.github/workflows/release.yaml]
+        source_refs: 'refs/tags/v.*'
+        allow_self_hosted: true
+        require_attestation: false
+        tags: 'v[0-9.]+|latest'
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -94,6 +103,11 @@ images:
 
 	event := func(e string) githubClaims {
 		return githubClaims{Repository: "example/gated", Ref: "refs/heads/master", RunnerEnvironment: "github-hosted", EventName: e}
+	}
+
+	signed := func(cl githubClaims, workflow string) githubClaims { cl.JobWorkflowRef = workflow; return cl }
+	private := func(workflow string) githubClaims {
+		return githubClaims{Repository: "example/private", RepositoryID: "3003", Ref: "refs/tags/v1.0.0", RunnerEnvironment: "self-hosted", JobWorkflowRef: workflow}
 	}
 
 	cases := []struct {
@@ -114,9 +128,13 @@ images:
 		{"self-hosted exception", "heavy", selfHosted("example/heavy"), nil, true},
 		{"builder repo's image", "client-image", hosted("example/builder", "refs/heads/master", ""), nil, true},
 		{"builder repo, unlisted image", "other", hosted("example/builder", "refs/heads/master", ""), nil, false},
-		{"locked: release tag by allowed actor", "locked", hosted("example/locked", "refs/tags/v1.2.3", "alice"), nil, true},
-		{"locked: branch build", "locked", hosted("example/locked", "refs/heads/master", "alice"), nil, false},
-		{"locked: other actor", "locked", hosted("example/locked", "refs/tags/v1.2.3", "mallory"), nil, false},
+		{"locked: release tag by allowed actor", "locked", signed(hosted("example/locked", "refs/tags/v1.2.3", "alice"), "example/locked/.github/workflows/release.yaml@refs/tags/v1.2.3"), nil, true},
+		{"locked: another workflow", "locked", signed(hosted("example/locked", "refs/tags/v1.2.3", "alice"), "example/locked/.github/workflows/release.yaml.evil.yaml@refs/tags/v1.2.3"), nil, false},
+		{"trusted caller: its release workflow", "private", private("example/private/.github/workflows/release.yaml@refs/tags/v1.0.0"), []string{"v1.0.0", "latest"}, true},
+		{"trusted caller: another workflow", "private", private("example/private/.github/workflows/ci.yaml@refs/tags/v1.0.0"), []string{"v1.0.0"}, false},
+		{"trusted caller: tag outside its pattern", "private", private("example/private/.github/workflows/release.yaml@refs/tags/v1.0.0"), []string{"dev"}, false},
+		{"locked: branch build", "locked", signed(hosted("example/locked", "refs/heads/master", "alice"), "example/locked/.github/workflows/release.yaml@refs/heads/master"), nil, false},
+		{"locked: other actor", "locked", signed(hosted("example/locked", "refs/tags/v1.2.3", "mallory"), "example/locked/.github/workflows/release.yaml@refs/tags/v1.2.3"), nil, false},
 		{"unanchored ref regex matches the whole ref", "pinned", hosted("example/pinned", "refs/heads/main", ""), nil, true},
 		{"unanchored ref regex is not a prefix", "pinned", hosted("example/pinned", "refs/heads/main-evil", ""), nil, false},
 		{"unanchored ref regex is not a suffix", "pinned", hosted("example/pinned", "refs/heads/x/refs/heads/main", ""), nil, false},
@@ -476,5 +494,28 @@ func TestObserveJobByRepo(t *testing.T) {
 	observeJob("img", "publish", "example/caller", "", errors.New("refused"), time.Second)
 	if got := testutil.ToFloat64(jobsFinished.WithLabelValues("example/caller", "img", "publish", "failed")); got != 1 {
 		t.Fatalf("failed publish by caller = %v, want 1", got)
+	}
+}
+
+// A publisher that trusts the caller is never used by the poller, which has
+// no caller, and must be pinned to a repository and its workflows.
+func TestTrustedCallerLimits(t *testing.T) {
+	dir := t.TempDir()
+	load := func(pub string) (*config, error) {
+		path := filepath.Join(dir, "images.yaml")
+		if err := os.WriteFile(path, []byte("source: s.example\ndestination: d.example\nimages:\n  private:\n    publishers:\n"+pub), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return loadConfig(path)
+	}
+	if _, err := load("      - repo: example/private\n        require_attestation: false\n"); err == nil {
+		t.Fatal("require_attestation: false accepted without repo_id and signer_workflows")
+	}
+	cfg, err := load("      - repo: example/private\n        repo_id: 3003\n        signer_workflows: [example/private/.github/workflows/release.yaml]\n        require_attestation: false\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.tagAllowed("private", "v1.0.0") {
+		t.Fatal("the poller may fill tags of an image only a trusted caller can publish")
 	}
 }

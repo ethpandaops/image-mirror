@@ -59,6 +59,7 @@ type jobRecord struct {
 	Image, Pairs, RequestID string
 	Repo, RepoID            string
 	State                   string // running, done or failed
+	Trust                   bool   // authorised by the caller's identity, not attestations
 	Out                     string
 	Start, End              time.Time
 }
@@ -68,6 +69,7 @@ func (r jobRecord) fields() []any {
 		"image", r.Image, "pairs", r.Pairs, "request", r.RequestID,
 		"repo", r.Repo, "repo_id", r.RepoID, "state", r.State,
 		"start", strconv.FormatInt(r.Start.UnixMilli(), 10),
+		"trust", strconv.FormatBool(r.Trust),
 	}
 }
 
@@ -82,6 +84,7 @@ func parseJob(m map[string]string) (jobRecord, bool) {
 	return jobRecord{
 		Image: m["image"], Pairs: m["pairs"], RequestID: m["request"],
 		Repo: m["repo"], RepoID: m["repo_id"], State: m["state"], Out: m["out"],
+		Trust: m["trust"] == "true",
 		Start: ms("start"), End: ms("end"),
 	}, true
 }
@@ -228,7 +231,7 @@ func (s *server) runJob(id string, rec jobRecord) {
 	defer release()
 	log := slog.With("job", id, "request", rec.RequestID, "image", rec.Image, "repo", rec.Repo)
 	start := time.Now()
-	out, err := s.mirror(ctx, rec.Image, strings.Fields(rec.Pairs), rec.RequestID, false)
+	out, err := s.mirror(ctx, rec.Image, strings.Fields(rec.Pairs), rec.RequestID, false, rec.Trust)
 	if ctx.Err() != nil {
 		log.Warn("job interrupted; leaving it for another replica", "cause", context.Cause(ctx))
 		jobsHandedOver.Inc()

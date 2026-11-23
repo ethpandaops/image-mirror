@@ -141,7 +141,18 @@ authorise() {
 }
 
 # One publisher must authorise the whole request: all tags and all digests.
+# With TRUST_CALLER, the service has already matched the authenticated
+# publishing job to RULE's publishers, which don't require attestations, and
+# that job vouches for these digests; only the tags are re-checked here.
 authorised=""
+if [[ ${TRUST_CALLER:-false} == true ]]; then
+  jq -e --args '[.[] | (.tags // "") as $re | (.exclude_tags // "") as $ex
+      | ($re == "" or ($ARGS.positional | all(test($re)))) and ($ex == "" or ($ARGS.positional | all(test($ex) | not)))]
+    | any' "${tags[@]}" <<<"$RULE" >/dev/null || fail "tags not allowed for ${IMAGE}"
+  echo "trusted publishing job: ${#seen[@]} manifests, no attestations required"
+  authorised=1
+  RULE='[]' # skip the attestation checks below
+fi
 while read -r pub; do
   jq -n -e --argjson p "$pub" '($p.tags // "") as $re | ($p.exclude_tags // "") as $ex
     | ($re == "" or ($ARGS.positional | all(test($re)))) and ($ex == "" or ($ARGS.positional | all(test($ex) | not)))' \

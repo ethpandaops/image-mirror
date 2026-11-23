@@ -285,6 +285,24 @@ func TestScriptDestinationMustExist(t *testing.T) {
 	}
 }
 
+// A trusted caller's digests are copied without attestations, but only by a
+// run the service marked as trusted, and only for allowed tags.
+func TestScriptTrustedCaller(t *testing.T) {
+	f := newFakeTools(t)
+	d := f.image("v1.0.0", "amd64") // nothing attests it
+	pub := "      - repo: example/app\n        repo_id: 1001\n        signer_workflows: [example/app/.github/workflows/release.yml]\n        require_attestation: false\n        tags: 'v[0-9.]+'\n"
+	if out, err := f.run(pub, "v1.0.0@"+d); err == nil || f.copies() != "" {
+		t.Fatalf("copied an unattested image without TRUST_CALLER:\n%s", out)
+	}
+	f.set("digest", "src.example/img:dev", []byte(d))
+	if out, err := f.run(pub, "dev@"+d, "TRUST_CALLER=true"); err == nil || f.copies() != "" {
+		t.Fatalf("a trusted caller published a tag outside the pattern:\n%s", out)
+	}
+	if out, err := f.run(pub, "v1.0.0@"+d, "TRUST_CALLER=true"); err != nil || f.copies() == "" {
+		t.Fatalf("trusted caller's image wasn't copied (err %v):\n%s", err, out)
+	}
+}
+
 // The poller runs with FILL_ONLY: re-pointing a source tag at another attested
 // digest (rolling latest back, say) must not move the destination tag.
 func TestScriptFillOnlyNeverMovesTags(t *testing.T) {
