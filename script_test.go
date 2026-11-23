@@ -34,6 +34,11 @@ case "$1 $2" in
 esac
 `
 
+const fakeCurl = `#!/usr/bin/env bash
+echo "$*" >> "$FIX/curl.log"
+[[ -e "$FIX/on-docker-hub" ]]
+`
+
 const fakeGh = `#!/usr/bin/env bash
 key() { printf '%s' "$1" | tr -c 'A-Za-z0-9' _; }
 echo "$*" >> "$FIX/gh.log"
@@ -64,6 +69,7 @@ func newFakeTools(t *testing.T) *fakeTools {
 	}
 	f.write(f.bin+"/regctl", fakeRegctl)
 	f.write(f.bin+"/gh", fakeGh)
+	f.write(f.bin+"/curl", fakeCurl)
 	return f
 }
 
@@ -282,6 +288,27 @@ func TestScriptDestinationMustExist(t *testing.T) {
 	}
 	if log, _ := os.ReadFile(filepath.Join(f.fix, "regctl.log")); strings.Count(string(log), "tag ls") != 1 {
 		t.Fatalf("listed destination tags although a requested tag exists:\n%s", log)
+	}
+}
+
+func TestScriptEmptyDockerHubDestination(t *testing.T) {
+	f := newFakeTools(t)
+	d := f.image("main", "amd64")
+	f.attestTree(d, []string{"amd64"}, cert(nil))
+	f.write(filepath.Join(f.fix, "no-destination"), "")
+	hub := "DESTINATION=docker.io/example"
+	if out, err := f.run("      - repo: example/app\n", "main@"+d, hub); err == nil || !strings.Contains(out, "docker.io/example/img does not exist") || f.copies() != "" {
+		t.Fatalf("copied to a missing Docker Hub repository (err %v):\n%s", err, out)
+	}
+	f.write(filepath.Join(f.fix, "on-docker-hub"), "")
+	if out, err := f.run("      - repo: example/app\n", "main@"+d); err == nil || f.copies() != "" {
+		t.Fatalf("asked Docker Hub about another registry (err %v):\n%s", err, out)
+	}
+	if out, err := f.run("      - repo: example/app\n", "main@"+d, hub); err != nil || f.copies() == "" {
+		t.Fatalf("an empty Docker Hub repository didn't count (err %v):\n%s", err, out)
+	}
+	if log, _ := os.ReadFile(filepath.Join(f.fix, "curl.log")); !strings.Contains(string(log), "https://hub.docker.com/v2/repositories/example/img/") {
+		t.Fatalf("didn't ask Docker Hub about the repository:\n%s", log)
 	}
 }
 
