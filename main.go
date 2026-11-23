@@ -285,6 +285,9 @@ func main() {
 	s := newServer(cfg, *script, newVerifier(githubIssuer, *audience, &keySet{url: discovery.JWKSURL, client: client, minRefresh: time.Minute}), rdb)
 	s.tokens = tokens
 	s.limits = lim
+	configuredLimit.WithLabelValues("jobs").Set(float64(lim.jobs))
+	configuredLimit.WithLabelValues("jobs_per_repo").Set(float64(lim.jobsPerRepo))
+	configuredLimit.WithLabelValues("poll_per_image").Set(float64(lim.pollPerImage))
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()

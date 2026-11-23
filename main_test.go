@@ -457,6 +457,10 @@ func TestLimitsAcrossReplicas(t *testing.T) {
 	if code, body := rt.do(srvB, "POST", "/v1/mirror", `{"image":"app","tags":[`+rt.pair+`]}`); code != 429 {
 		t.Fatalf("third job across two replicas: %d %s", code, body)
 	}
+	time.Sleep(3 * b.reapEvery) // the reapers publish the per-repo count
+	if got := testutil.ToFloat64(jobsActiveByRepo.WithLabelValues("example/app")); got != 2 {
+		t.Fatalf("active jobs for example/app = %v, want 2", got)
+	}
 }
 
 // Metrics name the repository that published each image, and count only the

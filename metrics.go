@@ -46,6 +46,14 @@ var (
 		Name: "image_mirror_jobs_active",
 		Help: "Unfinished publish jobs across all replicas.",
 	})
+	jobsActiveByRepo = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "image_mirror_jobs_active_by_repo",
+		Help: "Unfinished publish jobs across all replicas, by calling repository.",
+	}, []string{"repo"})
+	configuredLimit = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "image_mirror_limit",
+		Help: "Configured limits: jobs (total), jobs_per_repo, poll_per_image.",
+	}, []string{"limit"})
 	jobsResumed = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "image_mirror_jobs_resumed_total",
 		Help: "Jobs this replica took over from a replica that stopped or drained.",

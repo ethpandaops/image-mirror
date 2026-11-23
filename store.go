@@ -260,6 +260,7 @@ func (s *server) reapLoop(ctx context.Context) {
 			continue
 		}
 		jobsActive.Set(float64(len(ids)))
+		s.countByRepo(ctx, ids)
 		if s.draining.Load() {
 			continue
 		}
@@ -279,5 +280,29 @@ func (s *server) reapLoop(ctx context.Context) {
 			s.jobsWG.Add(1)
 			go s.runJob(id, rec)
 		}
+	}
+}
+
+// countByRepo sets image_mirror_jobs_active_by_repo from the active jobs.
+func (s *server) countByRepo(ctx context.Context, ids []string) {
+	cmds, err := s.rdb.Pipelined(ctx, func(p redis.Pipeliner) error {
+		for _, id := range ids {
+			p.HGet(ctx, jobKey(id), "repo")
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, redis.Nil) {
+		redisErrors.Inc()
+		return
+	}
+	counts := map[string]int{}
+	for _, c := range cmds {
+		if repo, err := c.(*redis.StringCmd).Result(); err == nil {
+			counts[repo]++
+		}
+	}
+	jobsActiveByRepo.Reset()
+	for repo, n := range counts {
+		jobsActiveByRepo.WithLabelValues(repo).Set(float64(n))
 	}
 }
