@@ -363,7 +363,10 @@ func newServer(cfg *config, script string, verifier *oidc.IDTokenVerifier, rdb r
 		cfg:        cfg,
 		script:     script,
 		verifier:   verifier,
-		inlineWait: 25 * time.Second,
+		// Short, so callers spend the wait polling GET /v1/jobs/{id}, which
+		// any replica answers, rather than holding a connection to one
+		// replica that may stop.
+		inlineWait: time.Second,
 		limits:     defaultLimits,
 		rdb:        rdb,
 		replica:    host + "-" + randomHex(4),
