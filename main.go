@@ -74,8 +74,8 @@ type image struct {
 	// Poll is whether the background poller backfills this image. Turn it off
 	// for images whose tags grow without bound (a tag per commit): the poller
 	// reads every source tag's digest each cycle. Publish requests still work.
-	Poll *bool `yaml:"poll"`
-	CreateDestination bool `yaml:"create_destination"`
+	Poll              *bool `yaml:"poll"`
+	CreateDestination bool  `yaml:"create_destination"`
 }
 
 // publisher says which repo may publish an image, and under which conditions.
