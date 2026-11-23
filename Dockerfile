@@ -32,8 +32,8 @@ RUN apk add --no-cache curl \
  && chmod 0755 /out/*
 
 FROM alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f
-# bash is the only package added; CA roots come with the base image.
-RUN apk add --no-cache bash \
+# bash and curl are the only packages added; CA roots come with the base image.
+RUN apk add --no-cache bash curl \
  && addgroup -g 10001 mirror \
  && adduser -D -u 10001 -G mirror mirror
 COPY --from=tools /out/ /usr/local/bin/

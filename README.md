@@ -35,7 +35,8 @@ A request is refused unless:
 - every tag matches the publisher's tag pattern;
 - each source tag currently points at the requested digest;
 - the destination repository already exists. image-mirror never creates
-  repositories.
+  repositories. A public Docker Hub repository that has no tags yet counts
+  (the registry reports those as missing, so Docker Hub's API is asked).
 
 ## Triggering a mirror
 
