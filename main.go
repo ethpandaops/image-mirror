@@ -815,10 +815,16 @@ func (s *server) pollLoop(ctx context.Context, every time.Duration) {
 			pollCycles.Observe(time.Since(start).Seconds())
 			s.jobsWG.Done()
 		}
+		// A replica without the lease checks again soon, so the poller moves
+		// to another replica within seconds of its holder stopping.
+		wait := every
+		if lctx == nil {
+			wait = min(every, leaseTTL/3)
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(every):
+		case <-time.After(wait):
 		}
 	}
 }
