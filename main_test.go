@@ -178,6 +178,31 @@ images:
 	}
 }
 
+func TestConfigCreateDestination(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "images.yaml")
+	if err := os.WriteFile(path, []byte(`
+source: ghcr.io/example
+destination: docker.io/example
+images:
+  app:
+    publishers:
+      - repo: example/app
+  new-app:
+    create_destination: true
+    publishers:
+      - repo: example/app
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Images["app"].CreateDestination || !cfg.Images["new-app"].CreateDestination {
+		t.Fatalf("create_destination: app %v, new-app %v", cfg.Images["app"].CreateDestination, cfg.Images["new-app"].CreateDestination)
+	}
+}
+
 // testIssuer serves a JWKS and signs tokens with its keys.
 type testIssuer struct {
 	t     *testing.T
