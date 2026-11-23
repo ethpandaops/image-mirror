@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,6 +21,7 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/go-jose/go-jose/v4"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -454,5 +456,21 @@ func TestLimitsAcrossReplicas(t *testing.T) {
 	}
 	if code, body := rt.do(srvB, "POST", "/v1/mirror", `{"image":"app","tags":[`+rt.pair+`]}`); code != 429 {
 		t.Fatalf("third job across two replicas: %d %s", code, body)
+	}
+}
+
+// Metrics name the repository that published each image, and count only the
+// tags a run created or moved.
+func TestObserveJobByRepo(t *testing.T) {
+	out := "verified sha256:9d4a17160bea: Example/Builder refs/heads/master github-hosted example/builder/.github/workflows/deploy.yml\n" +
+		"d.example/img:main -> sha256:9d4a17160bea (copied)\n" +
+		"d.example/img:main-abc -> sha256:9d4a17160bea (already current)\n"
+	observeJob("img", "poll", "", out, nil, time.Second)
+	if got := testutil.ToFloat64(tagsCopied.WithLabelValues("example/builder", "img")); got != 1 {
+		t.Fatalf("tags copied for the verified repo = %v, want 1", got)
+	}
+	observeJob("img", "publish", "example/caller", "", errors.New("refused"), time.Second)
+	if got := testutil.ToFloat64(jobsFinished.WithLabelValues("example/caller", "img", "publish", "failed")); got != 1 {
+		t.Fatalf("failed publish by caller = %v, want 1", got)
 	}
 }

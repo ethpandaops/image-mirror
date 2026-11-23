@@ -2,6 +2,7 @@ package main
 
 import (
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -13,10 +14,20 @@ var (
 		Name: "image_mirror_http_requests_total",
 		Help: "API requests by route and status code.",
 	}, []string{"route", "code"})
+	// repo and image label only admitted work, so their values are bounded by
+	// the allowlist: anyone with a GitHub OIDC token can call the service.
 	jobsFinished = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "image_mirror_jobs_finished_total",
-		Help: "Verify-and-copy runs by image, source (publish or poll) and result (success, failed, rate_limited).",
-	}, []string{"image", "source", "result"})
+		Help: "Verify-and-copy runs by publishing repository, image, source (publish or poll) and result (success, failed, rate_limited).",
+	}, []string{"repo", "image", "source", "result"})
+	tagsCopied = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "image_mirror_tags_copied_total",
+		Help: "Destination tags created or moved, by publishing repository and image.",
+	}, []string{"repo", "image"})
+	lastPublish = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "image_mirror_last_success_timestamp_seconds",
+		Help: "When a run from this repository last succeeded for this image.",
+	}, []string{"repo", "image"})
 	jobDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "image_mirror_job_duration_seconds",
 		Help:    "Verify-and-copy run time, including waiting for the image lock.",
@@ -62,9 +73,23 @@ var (
 	})
 )
 
-var rateLimitedRe = regexp.MustCompile(`(?i)toomanyrequests|http 429|status 429`)
+var (
+	rateLimitedRe = regexp.MustCompile(`(?i)toomanyrequests|http 429|status 429`)
+	// The script names the repository whose attestation it accepted, and
+	// marks each tag it created or moved.
+	verifiedRepoRe = regexp.MustCompile(`(?m)^verified [^ ]+: ([^ /]+/[^ /]+) `)
+	copiedRe       = regexp.MustCompile(`(?m) \(copied\)$`)
+)
 
-func observeJob(image, source, out string, err error, d time.Duration) {
+// observeJob records a run. repo is the caller for publish requests; for the
+// poller it's the repository the script verified, if it got that far.
+func observeJob(image, source, repo, out string, err error, d time.Duration) {
+	if repo == "" {
+		repo = "unknown"
+		if m := verifiedRepoRe.FindStringSubmatch(out); m != nil {
+			repo = strings.ToLower(m[1])
+		}
+	}
 	result := "success"
 	switch {
 	case err != nil && rateLimitedRe.MatchString(out):
@@ -72,6 +97,10 @@ func observeJob(image, source, out string, err error, d time.Duration) {
 	case err != nil:
 		result = "failed"
 	}
-	jobsFinished.WithLabelValues(image, source, result).Inc()
+	jobsFinished.WithLabelValues(repo, image, source, result).Inc()
 	jobDuration.WithLabelValues(source, result).Observe(d.Seconds())
+	if err == nil {
+		tagsCopied.WithLabelValues(repo, image).Add(float64(len(copiedRe.FindAllString(out, -1))))
+		lastPublish.WithLabelValues(repo, image).SetToCurrentTime()
+	}
 }

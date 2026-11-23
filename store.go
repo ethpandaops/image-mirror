@@ -234,7 +234,7 @@ func (s *server) runJob(id string, rec jobRecord) {
 		jobsHandedOver.Inc()
 		return
 	}
-	observeJob(rec.Image, "publish", out, err, time.Since(start))
+	observeJob(rec.Image, "publish", rec.Repo, out, err, time.Since(start))
 	s.finishJob(id, out, err != nil)
 	if err != nil {
 		log.Warn("mirror failed", "err", err, "elapsed", time.Since(rec.Start).Round(time.Millisecond))

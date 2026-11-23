@@ -360,9 +360,9 @@ func newServer(cfg *config, script string, verifier *oidc.IDTokenVerifier, rdb r
 	host, _ := os.Hostname()
 	jobsCtx, cancelJobs := context.WithCancel(context.Background())
 	return &server{
-		cfg:        cfg,
-		script:     script,
-		verifier:   verifier,
+		cfg:      cfg,
+		script:   script,
+		verifier: verifier,
 		// Short, so callers spend the wait polling GET /v1/jobs/{id}, which
 		// any replica answers, rather than holding a connection to one
 		// replica that may stop.
@@ -904,7 +904,7 @@ func (s *server) pollOnce(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			observeJob(name, "poll", out, err, time.Since(start))
+			observeJob(name, "poll", "", out, err, time.Since(start))
 			if err != nil {
 				_, digest, _ := strings.Cut(p, "@")
 				s.stateMu.Lock()
