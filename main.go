@@ -74,7 +74,8 @@ type image struct {
 	// Poll is whether the background poller backfills this image. Turn it off
 	// for images whose tags grow without bound (a tag per commit): the poller
 	// reads every source tag's digest each cycle. Publish requests still work.
-	Poll *bool `yaml:"poll"`
+	Poll              *bool `yaml:"poll"`
+	CreateDestination bool  `yaml:"create_destination"`
 }
 
 // publisher says which repo may publish an image, and under which conditions.
@@ -785,6 +786,7 @@ func (s *server) mirror(ctx context.Context, image string, pairs []string, reque
 		"REQUEST_ID="+requestID,
 		"FILL_ONLY="+strconv.FormatBool(fillOnly),
 		"TRUST_CALLER="+strconv.FormatBool(trustCaller),
+		"CREATE_DESTINATION="+strconv.FormatBool(s.cfg.Images[image].CreateDestination),
 	)
 	cmd.Stdout, cmd.Stderr = out, out
 	// On timeout, kill the script's whole process group, not just bash, so

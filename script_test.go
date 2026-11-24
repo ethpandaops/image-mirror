@@ -314,6 +314,22 @@ func TestScriptEmptyDockerHubDestination(t *testing.T) {
 
 // A trusted caller's digests are copied without attestations, but only by a
 // run the service marked as trusted, and only for allowed tags.
+func TestScriptCreatesTheDestinationOnlyWhenAllowed(t *testing.T) {
+	f := newFakeTools(t)
+	d := f.image("main", "amd64")
+	f.attestTree(d, []string{"amd64"}, cert(nil))
+	f.write(filepath.Join(f.fix, "no-destination"), "")
+	if out, err := f.run("      - repo: example/app\n", "main@"+d, "CREATE_DESTINATION=false"); err == nil || !strings.Contains(out, "does not exist") || f.copies() != "" {
+		t.Fatalf("copied to a missing destination (err %v):\n%s", err, out)
+	}
+	if out, err := f.run("      - repo: example/other\n", "main@"+d, "CREATE_DESTINATION=true"); err == nil || f.copies() != "" {
+		t.Fatalf("created a destination for a request no publisher allows (err %v):\n%s", err, out)
+	}
+	if out, err := f.run("      - repo: example/app\n", "main@"+d, "CREATE_DESTINATION=true"); err != nil || f.copies() == "" {
+		t.Fatalf("didn't copy to a missing destination it may create (err %v):\n%s", err, out)
+	}
+}
+
 func TestScriptTrustedCaller(t *testing.T) {
 	f := newFakeTools(t)
 	d := f.image("v1.0.0", "amd64") // nothing attests it

@@ -35,8 +35,9 @@ A request is refused unless:
 - every tag matches the publisher's tag pattern;
 - each source tag currently points at the requested digest;
 - the destination repository already exists. image-mirror never creates
-  repositories. A public Docker Hub repository that has no tags yet counts
-  (the registry reports those as missing, so Docker Hub's API is asked).
+  repositories unless the image sets `create_destination: true`. A public
+  Docker Hub repository that has no tags yet counts (the registry reports
+  those as missing, so Docker Hub's API is asked).
 
 ## Triggering a mirror
 
@@ -137,6 +138,12 @@ Set `poll: false` on an image to keep the poller away from it. The poller reads
 the digest of every allowed source tag of every image each cycle, so an image
 that gains a tag per commit makes every cycle slower; with `poll: false` its
 tags only reach the destination through publish requests.
+
+Set `create_destination: true` on an image to let its first copy go ahead when
+the destination repository doesn't exist. The push then creates it, after the
+request has passed every other check, with the visibility the destination
+gives new repositories: on Docker Hub that is the organisation's default, so
+check it is public before relying on this.
 
 A request is allowed when one publisher allows all of it. Unknown fields are
 an error, so a misspelt restriction can't be silently ignored. Regexes must

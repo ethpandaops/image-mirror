@@ -51,7 +51,8 @@ on_docker_hub() {
   [[ $dest == docker.io/* ]] || return 1
   curl -fsS -o /dev/null --max-time 20 "https://hub.docker.com/v2/repositories/${dest#docker.io/}/"
 }
-[[ -n $dest_exists ]] || regctl tag ls --limit 1 "$dest" >/dev/null 2>&1 || on_docker_hub >/dev/null 2>&1 || fail "${dest} does not exist"
+[[ -n $dest_exists ]] || regctl tag ls --limit 1 "$dest" >/dev/null 2>&1 || on_docker_hub >/dev/null 2>&1 \
+  || [[ ${CREATE_DESTINATION:-false} == true ]] || fail "${dest} does not exist"
 
 # Every manifest behind every tag (index and per-platform manifests). This runs
 # before anything is verified, on content anyone who can push to the source
