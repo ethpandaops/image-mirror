@@ -52,7 +52,6 @@ const (
 	scriptTimeout      = 15 * time.Minute // one verify-and-copy run, after the image lock
 )
 
-// config is the allowlist.
 type config struct {
 	// Images are copied from <Source>/<image> to <Destination>/<image>.
 	Source      string `yaml:"source"`
@@ -66,7 +65,6 @@ type config struct {
 	Images map[string]*image `yaml:"images"`
 }
 
-// image is one allowlisted image.
 type image struct {
 	// Publishers are the repos that may publish the image, each under its
 	// own conditions. A request needs one publisher to allow all of it.
@@ -701,7 +699,6 @@ func writeJob(w http.ResponseWriter, rec jobRecord) {
 	fmt.Fprintf(w, "%smirrored in %s\n", rec.Out, elapsed)
 }
 
-// counted records each response's status code.
 func counted(route string, h http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sw := &statusWriter{ResponseWriter: w, code: http.StatusOK}
@@ -720,7 +717,6 @@ func (w *statusWriter) WriteHeader(code int) {
 	w.ResponseWriter.WriteHeader(code)
 }
 
-// authenticate verifies the request's GitHub OIDC token.
 func (s *server) authenticate(w http.ResponseWriter, r *http.Request) (githubClaims, bool) {
 	var claims githubClaims
 	raw, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")

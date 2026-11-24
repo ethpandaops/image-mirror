@@ -54,7 +54,6 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) 
 return 0
 `)
 
-// jobRecord is a job as stored in Redis.
 type jobRecord struct {
 	Image, Pairs, RequestID string
 	Repo, RepoID            string
@@ -147,7 +146,6 @@ func (s *server) finishJob(id, out string, failed bool) {
 	}
 }
 
-// tryAcquire takes the lease on key if nobody holds it.
 func (s *server) tryAcquire(ctx context.Context, key string) bool {
 	ok, err := s.rdb.SetNX(ctx, key, s.replica, leaseTTL).Result()
 	if err != nil {
